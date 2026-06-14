@@ -18,3 +18,8 @@ sessions.json
 # Runtime output (logs redirected to file)
 run.out
 *.out
+
+# Backup files
+*.bak
+*.bak.*
+bridge.pid

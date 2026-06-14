@@ -16,12 +16,17 @@ Security posture (the "必做 + Docker + 危险操作确认" tier):
   - docker exec only receives necessary env vars, not the full host environment.
 """
 import asyncio
+import atexit
+import signal
+import time
 import json
 import logging
 import os
 import subprocess
 import sys
 import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import lark_oapi as lark
@@ -68,13 +73,28 @@ _chat_engine: dict[str, str] = {}
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(os.path.dirname(__file__), "bridge.log"))],
+    handlers=[logging.StreamHandler(), logging.StreamHandler(open(os.path.join(os.path.dirname(__file__), "bridge.log"), "a", buffering=1))],
 )
 log = logging.getLogger("bridge")
 
+
+
 import session_store  # local module
 
-client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
+client = (
+    lark.Client.builder()
+    .app_id(APP_ID)
+    .app_secret(APP_SECRET)
+    .timeout(float(os.environ.get("LARK_TIMEOUT", "10")))
+    .build()
+)
+
+# Worker pool for Feishu card API calls made from the lark ws event-loop
+# thread (on_message / on_card_action). Running these synchronous HTTP calls
+# inline would block the single-threaded lark loop and stall heartbeats; offloading
+# to a pool keeps the loop responsive. (Per-turn streaming cards are handled by the
+# _render_loop thread spawned per Job, not this pool.)
+_card_workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="card")
 
 # confirm_id -> callable(allow: bool) that pushes the reply into the agent stdin
 _confirm_waiters: dict[str, "Job"] = {}
@@ -149,6 +169,8 @@ def _confirm_buttons(confirm_id: str) -> list:
 class Job:
     chat_id: str
     proc: subprocess.Popen
+    engine: str  # "claude" | "opencode" — namespaces session_store keys per engine
+    out_q: queue.Queue  # raw stdout lines -> _render_loop (decouples read from HTTP)
     card_msg_id: str | None = None
     transcript: str = ""
     confirm_card_id: str | None = None  # message_id of the pending confirm card
@@ -169,26 +191,53 @@ class Job:
 
 
 def _drain_job(job: Job) -> None:
-    """Read newline-JSON from the agent and reflect it onto Feishu cards."""
-    for raw in job.proc.stdout:
-        raw = raw.strip()
-        if not raw:
-            continue
+    """READ-ONLY thread: pull newline-JSON from the agent stdout and enqueue it.
+
+    Deliberately makes NO Feishu API calls here. A slow lark HTTP call inline would
+    stall this read loop, fill the OS pipe buffer, and back-pressure the agent's
+    stdout writes — which is exactly what blocked its `confirm_request` emit and
+    caused multi-minute stalls. Rendering happens in _render_loop on another thread.
+    """
+    try:
+        for raw in job.proc.stdout:
+            raw = raw.strip()
+            if raw:
+                job.out_q.put(raw)
+    finally:
+        job.out_q.put(None)  # sentinel: process exited, stop the renderer
+        job.proc.wait()
+
+
+def _render_loop(job: Job) -> None:
+    """Render thread: consume the agent's JSON lines and reflect them onto Feishu.
+
+    Runs independently of _drain_job, so a slow lark HTTP call only delays this
+    card update — it never blocks the agent's stdout from being read.
+    """
+    while True:
+        raw = job.out_q.get()
+        if raw is None:  # sentinel from _drain_job: process ended
+            break
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
+            log.info("agent stderr: %s", raw[:200])
             continue
         mtype = msg.get("type")
 
         if mtype == "text":
-            job.transcript += msg["text"]
+            with job.lock:
+                job.transcript += msg["text"]
             job.render()
         elif mtype == "tool":
             extra = f"\n\n> 🔧 {msg['name']}: `{msg.get('brief','')[:120]}`"
-            job.transcript += extra
+            with job.lock:
+                job.transcript += extra
             job.render()
         elif mtype == "session":
-            session_store.put(job.chat_id, msg["session_id"])
+            # Namespace by engine so OpenCode's 'ses_xxx' ids never reach
+            # claude's --resume (which requires a UUID).
+            session_store.put(f"{job.engine}:{job.chat_id}", msg["session_id"])
         elif mtype == "confirm_request":
             cid = msg["id"]
             with _confirm_lock:
@@ -206,20 +255,30 @@ def _drain_job(job: Job) -> None:
                 f"在 {CONFIRM_TIMEOUT}s 内选择(超时自动拒绝):"
             )
             job.confirm_card_id = _post_card(job.chat_id, card_text, _confirm_buttons(cid))
+            log.info("confirm card posted: id=%s tool=%s", cid, msg.get("tool"))
         elif mtype == "result":
             final = msg.get("text", "").strip()
             if final and final not in job.transcript:
-                job.transcript += "\n" + final
+                with job.lock:
+                    job.transcript += "\n" + final
             job.render()
         elif mtype == "error":
             job.render(f"\n\n❌ 出错: {msg.get('message')}")
+        else:
+            log.info("agent diagnostic: %s", str(msg)[:300])
 
-    job.proc.wait()
+
+# Wrapper that logs exceptions swallowed by ThreadPoolExecutor
+def _safe_start_turn(chat_id: str, text: str) -> None:
+    try:
+        _start_turn(chat_id, text)
+    except Exception:
+        log.exception("CRASH in _start_turn")
 
 
 def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     engine = engine or _chat_engine.get(chat_id, DEFAULT_ENGINE)
-    resume = session_store.get(chat_id)
+    resume = session_store.get(f"{engine}:{chat_id}")
     # OpenCode sessions are ephemeral — each runner starts a fresh server,
     # so cross-runner resume is meaningless.
     if engine == "opencode":
@@ -273,14 +332,20 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
         env=_clean_env,
     )
-    job = Job(chat_id=chat_id, proc=proc)
+    job = Job(chat_id=chat_id, proc=proc, engine=engine, out_q=queue.Queue())
     job.card_msg_id = _post_card(chat_id, "🤔 已收到,正在处理…")
+    # Read thread: drains agent stdout into job.out_q (no HTTP, never stalls).
+    # Render thread: consumes job.out_q and calls lark API to update cards.
+    # Splitting these is what stops a slow lark HTTP call from back-pressuring
+    # the agent's stdout (the root cause of multi-minute stalls).
     threading.Thread(target=_drain_job, args=(job,), daemon=True).start()
+    log.info("turn started: engine=%s threads=drain+render", engine)
+    threading.Thread(target=_render_loop, args=(job,), daemon=True).start()
 
 
 # ---------------------------------------------------------------- event handlers
@@ -294,7 +359,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         return
 
     if ev.message.message_type != "text":
-        _post_card(chat_id, "目前只支持文本指令。")
+        _card_workers.submit(_post_card, chat_id, "目前只支持文本指令。")
         return
 
     try:
@@ -306,21 +371,28 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 
     # simple slash commands
     if text in ("/new", "/reset"):
-        session_store.clear(chat_id)
-        _post_card(chat_id, "🧹 已清除会话上下文,下条消息将开启新会话。")
+        # Clear sessions for both engines (keys are namespaced).
+        session_store.clear(f"claude:{chat_id}")
+        session_store.clear(f"opencode:{chat_id}")
+        _card_workers.submit(_post_card, chat_id, "🧹 已清除会话上下文,下条消息将开启新会话。")
         return
     if text.startswith("/engine "):
         eng = text.split(" ", 1)[1].strip().lower()
         if eng in ("claude", "opencode"):
             _chat_engine[chat_id] = eng
-            session_store.clear(chat_id)  # sessions are engine-specific
-            _post_card(chat_id, f"⚙️ 引擎已切换: {eng}")
+            session_store.clear(f"claude:{chat_id}")  # sessions are engine-specific
+            session_store.clear(f"opencode:{chat_id}")
+            _card_workers.submit(_post_card, chat_id, f"⚙️ 引擎已切换: {eng}")
         else:
-            _post_card(chat_id, f"未知引擎: {eng}。可用: claude / opencode")
+            _card_workers.submit(_post_card, chat_id, f"未知引擎: {eng}。可用: claude / opencode")
         return
 
     log.info("turn from %s in %s: %s", sender_id, chat_id, text[:80])
-    _start_turn(chat_id, text)
+    # Run _start_turn on a worker thread: it makes a synchronous _post_card call
+    # ("已收到" card) that would otherwise block the lark ws event loop and stall
+    # heartbeats. Offloading the whole turn-start keeps card_msg_id assignment
+    # ordered before the read/render threads start.
+    _card_workers.submit(_safe_start_turn, chat_id, text)
 
 
 def on_card_action(data) -> dict | None:
@@ -349,19 +421,50 @@ def on_card_action(data) -> dict | None:
     with _confirm_lock:
         job = _confirm_waiters.pop(cid, None)
 
+    log.info("card action: job=%s cid=%s", "found" if job else "NONE", cid)
     if job is None:
-        # Already handled, expired, or timed out before the tap landed.
+    # Already handled, expired, or timed out before the tap landed.
         return {"toast": {"type": "info", "content": "该确认已失效或已处理"}}
 
+    # answer_confirm writes the agent's stdin (local IO, no network) — keep inline
+    # so the agent unblocks the instant the user taps, before any card rendering.
+    log.info("answering confirm: cid=%s allow=%s proc_alive=%s", cid, str(allow), str(job.proc.poll() is None))
     job.answer_confirm(cid, allow)
     verdict = "✅ 已允许" if allow else "🚫 已拒绝"
     if job.confirm_card_id:
-        _patch_card(job.confirm_card_id, f"{verdict}(操作 `{cid}`)")
+        _card_workers.submit(_patch_card, job.confirm_card_id, f"{verdict}(操作 `{cid}`)")
     # Instant toast feedback on the tapped button.
     return {"toast": {"type": "success" if allow else "info", "content": verdict}}
 
 
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.pid")
+
+def _ensure_single_instance() -> None:
+    """Kill any previous bridge instance and write current PID."""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE) as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, signal.SIGTERM)
+            time.sleep(1)
+            try:
+                os.kill(old_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            log.info("Killed previous bridge instance (PID %s)", old_pid)
+        except (ValueError, ProcessLookupError, FileNotFoundError):
+            pass
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(lambda: os.remove(PID_FILE) if os.path.exists(PID_FILE) else None)
+
+
 def main() -> None:
+    _ensure_single_instance()
     handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(on_message)

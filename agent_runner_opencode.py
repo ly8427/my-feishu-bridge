@@ -26,7 +26,7 @@ Environment:
     OPENCODE_BIN           path to opencode binary (default: opencode)
     OPENCODE_API_KEY       API key for the selected provider (required)
     OPENCODE_API_URL       provider endpoint URL (default: zhipu coding plan)
-    OPENCODE_MODEL         provider/model format (default: zhipuai-coding-plan/glm-5.1)
+    OPENCODE_MODEL         provider/model format (default: zhipuai-coding-plan/glm-5.2)
     SAFE_TOOLS             comma-separated tools auto-allowed (read-only)
     CONFIRM_TIMEOUT        seconds to wait for a confirm_reply (default 300)
     WORKSPACE_DIR          working directory
@@ -60,8 +60,8 @@ OPENCODE_API_URL = os.environ.get(
     "OPENCODE_API_URL", "https://open.bigmodel.cn/api/coding/paas/v4"
 )
 OPENCODE_MODEL = os.environ.get(
-    "OPENCODE_MODEL", "zhipuai-coding-plan/glm-5.1"
-)  # provider/model format
+    "OPENCODE_MODEL", "zhipuai-coding-plan/glm-5.2"
+)  # provider/model format — requires auth.json with zhipuai-coding-plan credential
 
 
 _stdout_lock = threading.Lock()
@@ -87,6 +87,18 @@ def emit(obj: dict) -> None:
     with _stdout_lock:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+
+
+_t0 = 0.0  # process start time, set in run()
+
+
+def phase(name: str, **extra) -> None:
+    """Emit a timestamped phase marker as valid JSON."""
+    elapsed = round(time.time() - _t0, 3) if _t0 else 0.0
+    p = {"type": "_phase", "name": name, "elapsed": elapsed}
+    if extra:
+        p["extra"] = extra
+    emit(p)
 
 
 def _truncate(s: str, limit: int) -> str:
@@ -228,6 +240,7 @@ def _stdin_reader() -> None:
 def _sse_reader(prompt: str, resume: str | None) -> None:
     """Subscribe to opencode SSE events and translate to bridge protocol."""
     global _session_id, _server_port
+    phase("sse_reader_enter", prompt_len=len(prompt))
 
     # 1) Wait for server to be ready
     deadline = time.time() + 30
@@ -244,6 +257,7 @@ def _sse_reader(prompt: str, resume: str | None) -> None:
         emit({"type": "error", "message": "OpenCode server did not become ready"})
         return
 
+    phase("server_ready")
     # 2) Create or resume session
     if resume:
         _session_id = resume
@@ -255,6 +269,7 @@ def _sse_reader(prompt: str, resume: str | None) -> None:
             return
         _session_id = data["id"]
         emit({"type": "session", "session_id": _session_id})
+        phase("session_created")
 
     # 3) Define event handler (must be before SSE connection)
     final_text_parts: list[str] = []
@@ -344,6 +359,8 @@ def _sse_reader(prompt: str, resume: str | None) -> None:
         elif etype == "permission.asked":
             perm_id = props.get("id", "")
             perm_type = props.get("permission", props.get("type")) or ""
+            sys.stderr.write(f"[DEBUG] permission.asked: type={perm_type} id={perm_id}\n")
+            sys.stderr.flush()
             perm_session = props.get("sessionID", _session_id)
             perm_title = props.get("title", "")
             metadata = props.get("metadata", {}) or {}
@@ -382,6 +399,8 @@ def _sse_reader(prompt: str, resume: str | None) -> None:
             _confirm_waiters[cid] = event
             # Store permission info so stdin_reader can reply directly
             _pending_perms[cid] = (perm_session, perm_id)
+            sys.stderr.write(f"[DEBUG] emitting confirm_request cid={cid} tool={tool_name}\n")
+            sys.stderr.flush()
             emit({
                 "type": "confirm_request",
                 "id": cid,
@@ -446,34 +465,44 @@ def _sse_reader(prompt: str, resume: str | None) -> None:
         conn.request("GET", "/event",
                      headers={"Accept": "text/event-stream"})
         resp = conn.getresponse()
+        phase("sse_connected")
 
         # 5) Now send the prompt — SSE is already listening
         _api("POST", f"/session/{_session_id}/prompt_async", {
             "agent": "build",
             "parts": [{"type": "text", "text": prompt}],
         })
+        phase("prompt_sent")
 
-        # 6) Read SSE events
-        line_buf = b""
+        # 6) Read SSE events (line-based — fixes buffering issue with read())
+        sys.stderr.write("[DEBUG] SSE read loop started\n")
+        sys.stderr.flush()
+        event_lines = []
         while not _stop_event.is_set():
-            chunk = resp.read(4096)
-            if not chunk:
-                time.sleep(0.05)
-                continue
-            line_buf += chunk
-            while b"\n\n" in line_buf:
-                raw, line_buf = line_buf.split(b"\n\n", 1)
-                raw_text = raw.decode("utf-8", errors="replace").strip()
-                for line in raw_text.split("\n"):
-                    line = line.strip()
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        try:
-                            evt = json.loads(data_str)
-                            if _on_event(evt):
-                                return
-                        except json.JSONDecodeError:
-                            pass
+            try:
+                raw = resp.readline()
+            except Exception as _e:
+                sys.stderr.write(f"[DEBUG] SSE read exception: {_e}\n")
+                sys.stderr.flush()
+                break
+            if not raw:
+                sys.stderr.write("[DEBUG] SSE stream ended\n")
+                sys.stderr.flush()
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            if line == "":
+                if event_lines:
+                    for el in event_lines:
+                        if el.startswith("data: "):
+                            try:
+                                evt = json.loads(el[6:])
+                                if _on_event(evt):
+                                    return
+                            except json.JSONDecodeError:
+                                pass
+                    event_lines = []
+            else:
+                event_lines.append(line)
 
         conn.close()
     except Exception as exc:
@@ -537,7 +566,8 @@ def _write_opencode_config() -> None:
 
 
 def run(prompt: str, resume: str | None) -> int:
-    global _server_proc, _server_port
+    global _t0, _server_proc, _server_port
+    _t0 = time.time()
 
     _write_opencode_config()
 

@@ -17,11 +17,15 @@ services:
       # OpenCode provider credentials (backward compat: also reads ZHIPU_API_KEY)
       OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
       OPENCODE_API_URL: ${OPENCODE_API_URL:-}
-      OPENCODE_MODEL: ${OPENCODE_MODEL:-zhipuai-coding-plan/glm-5.1}
+      OPENCODE_MODEL: ${OPENCODE_MODEL:-zhipuai-coding-plan/glm-5.2}
       ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
     volumes:
       # The ONLY host path the agent can see. Read-write inside this dir only.
       - ${WORKSPACE_DIR}:${WORKSPACE_DIR}
+      # OpenCode provider credentials (auth.json from opencode auth login).
+      # Mount host's credentials read-only so container rebuilds don't lose auth.
+      # Path is configurable; defaults to ~/.local/share/opencode/auth.json.
+      - ${OPENCODE_AUTH_FILE:-~/.local/share/opencode/auth.json}:/root/.local/share/opencode/auth.json:ro
     working_dir: ${WORKSPACE_DIR}
     restart: unless-stopped
     command: ["sleep", "infinity"]
