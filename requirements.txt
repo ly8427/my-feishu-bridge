@@ -1,0 +1,5 @@
+# Host bridge dependencies (installed in a host venv)
+lark-oapi==1.6.8
+
+# NOTE: claude-agent-sdk runs INSIDE the Docker container, not on the host.
+# It is installed in the image (see docker/Dockerfile), pinned there to 0.2.93.

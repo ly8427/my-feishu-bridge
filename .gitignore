@@ -1,0 +1,20 @@
+# Secrets — never commit (but .env.example IS the template)
+.env
+.env.local
+.env.prod
+.env.bak
+*.secret
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime state
+sessions.json
+*.log
+
+# Runtime output (logs redirected to file)
+run.out
+*.out

@@ -1,0 +1,27 @@
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: feishu-claude-agent:latest
+    container_name: feishu-claude-agent
+    # No published ports: the container is reached only via `docker exec`.
+    # No network access needed beyond Anthropic API (default bridge is fine;
+    # tighten with `network_mode` if you want to lock egress further).
+    environment:
+      # This machine uses a relay (base URL + auth token). Forward all three;
+      # unset ones simply resolve to empty. Set in your shell or via --env-file.
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # OpenCode provider credentials (backward compat: also reads ZHIPU_API_KEY)
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
+      OPENCODE_API_URL: ${OPENCODE_API_URL:-}
+      OPENCODE_MODEL: ${OPENCODE_MODEL:-zhipuai-coding-plan/glm-5.1}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+    volumes:
+      # The ONLY host path the agent can see. Read-write inside this dir only.
+      - ${WORKSPACE_DIR}:${WORKSPACE_DIR}
+    working_dir: ${WORKSPACE_DIR}
+    restart: unless-stopped
+    command: ["sleep", "infinity"]
