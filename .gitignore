@@ -23,3 +23,6 @@ run.out
 *.bak
 *.bak.*
 bridge.pid
+
+# Local dev scripts (contain host-specific paths)
+start_bridge_safe.sh
