@@ -141,7 +141,7 @@ bridge 已注册为 `feishu-bridge.service` 用户服务。
 
 ```bash
 # 开启 lingering（Windows 注销后服务不回收 —— 只需跑一次）
-sudo loginctl enable-linger liu
+sudo loginctl enable-linger $USER
 
 # 常用命令
 systemctl --user status  feishu-bridge      # 看状态
