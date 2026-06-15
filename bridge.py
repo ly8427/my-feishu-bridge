@@ -18,7 +18,6 @@ Security posture (the "必做 + Docker + 危险操作确认" tier):
 import asyncio
 import atexit
 import signal
-import time
 import json
 import logging
 import os
@@ -62,10 +61,29 @@ APP_ID = os.environ["FEISHU_APP_ID"]
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 ALLOWED_USER_ID = os.environ["ALLOWED_USER_ID"]
 CONTAINER_NAME = os.environ.get("CONTAINER_NAME", "feishu-claude-agent")
-WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/home/user/projects")
+WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR") or os.path.join(
+    os.path.expanduser("~"), "projects"
+)
 CONFIRM_TIMEOUT = os.environ.get("CONFIRM_TIMEOUT", "300")
 SAFE_TOOLS = os.environ.get("SAFE_TOOLS", "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookRead")
 DEFAULT_ENGINE = os.environ.get("ENGINE", "claude")
+
+# Anthropic/Claude-Code env vars forwarded into the agent container when the
+# claude engine runs. Auth (BASE_URL/AUTH_TOKEN/API_KEY) is always relevant;
+# the MODEL* and CLAUDE_CODE* vars let a relay-compatible endpoint pin which
+# model the in-container claude CLI actually requests (e.g. a deepseek/glm
+# model behind an anthropic-compatible relay). Only set vars are injected, so
+# unset entries are harmless. These are injected both via `docker exec -e`
+# AND into the Popen subprocess env — keep both sites in sync via this tuple.
+_CLAUDE_FORWARD_VARS = (
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+)
 
 # per-chat engine preference (chat_id -> "claude" | "opencode")
 _chat_engine: dict[str, str] = {}
@@ -286,7 +304,7 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     # Forward whichever Claude auth vars are set on the host. This machine uses
     # a relay (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN); an official key works too.
     cmd = ["docker", "exec", "-i"]
-    for var in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+    for var in _CLAUDE_FORWARD_VARS:
         if os.environ.get(var):
             cmd += ["-e", f"{var}={os.environ[var]}"]
     if engine == "opencode":
@@ -315,8 +333,7 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     if resume:
         cmd += ["--resume", resume]
 
-    _passthrough_vars = (
-        "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+    _passthrough_vars = _CLAUDE_FORWARD_VARS + (
         "PATH", "HOME", "DOCKER_HOST", "TERM",
     )
     if engine == "opencode":
@@ -439,32 +456,101 @@ def on_card_action(data) -> dict | None:
 
 PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.pid")
 
-def _ensure_single_instance() -> None:
-    """Kill any previous bridge instance and write current PID."""
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE) as f:
-                old_pid = int(f.read().strip())
-            os.kill(old_pid, signal.SIGTERM)
-            time.sleep(1)
+# Module-level handle to the singleton lock file. The OS releases this advisory
+# lock (and thus the single-instance guarantee) only when the process truly
+# exits — including under SIGKILL / a hard crash. This replaces the previous
+# approach of killing the old instance, which relied on SIGKILL and so could
+# not run on Windows.
+_singleton_lockfh: object | None = None
+
+
+def _acquire_singleton_lock() -> bool:
+    """Acquire an exclusive, cross-platform lock on PID_FILE.
+
+    Returns True if acquired (this is the only running instance), False if a
+    live instance already holds the lock. Advisory-lock implementation:
+      - Unix: fcntl.flock(LOCK_EX | LOCK_NB)
+      - Win:  msvcrt.locking(LK_NBLCK)
+    The OS frees the lock automatically on process death, so a stale PID file
+    after a crash no longer blocks the next start.
+    """
+    global _singleton_lockfh
+    # "a+" neither truncates an existing PID nor fails when it is absent.
+    fh = open(PID_FILE, "a+")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
             try:
-                os.kill(old_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            log.info("Killed previous bridge instance (PID %s)", old_pid)
-        except (ValueError, ProcessLookupError, FileNotFoundError):
-            pass
-        try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                fh.close()
+                return False
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fh.close()
+                return False
+    except Exception:
+        # Locking unavailable on this platform — fall through rather than block.
+        fh.close()
+        return True
+    _singleton_lockfh = fh
+    return True
+
+
+def _release_singleton_lock() -> None:
+    """Release the singleton lock and clear the PID file on clean exit."""
+    global _singleton_lockfh
+    try:
+        if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
+    except OSError:
+        pass
+    if _singleton_lockfh is not None:
+        try:
+            _singleton_lockfh.close()
         except OSError:
             pass
+        _singleton_lockfh = None
+
+
+def _ensure_single_instance() -> None:
+    """Ensure only one bridge instance runs; refuse to start otherwise.
+
+    Cross-platform: no kill / no signals. If a live instance holds the lock we
+    exit with a clear message so the operator stops it explicitly. This is
+    safer than silently killing (the old path used SIGKILL — Windows-incompatible
+    and risky against an instance mid-turn).
+    """
+    if not _acquire_singleton_lock():
+        sys.exit(
+            f"Another bridge instance is running (lock held on {PID_FILE}). "
+            "Stop it first: python3 cli.py stop  (or: systemctl --user stop feishu-bridge)."
+        )
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
-    atexit.register(lambda: os.remove(PID_FILE) if os.path.exists(PID_FILE) else None)
+    atexit.register(_release_singleton_lock)
+
+
+def _on_stop_signal(signum, _frame) -> None:
+    """Graceful-stop hook for SIGINT/SIGTERM (both exist on Win/Mac/Linux).
+
+    We only flag intent + log; lark's ws.start() blocks and will unwind via the
+    KeyboardInterrupt that CPython raises out of a signal-interrupted recv().
+    Registering SIGTERM also means systemd/docker stop deliver a clean exit.
+    """
+    log.info("Received signal %s — shutting down bridge", signum)
 
 
 def main() -> None:
     _ensure_single_instance()
+    # SIGINT (Ctrl-C) works everywhere; SIGTERM lets systemd `stop` and
+    # `docker stop`-style supervisors shut us down cleanly. Neither uses the
+    # old SIGKILL path, so this is Windows-compatible.
+    signal.signal(signal.SIGINT, _on_stop_signal)
+    signal.signal(signal.SIGTERM, _on_stop_signal)
     handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(on_message)

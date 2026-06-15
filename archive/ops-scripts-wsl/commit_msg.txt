@@ -1,0 +1,9 @@
+fix: OpenCode SSE blocking, confirm card, PID singleton
+
+- Fix SSE reader: resp.read(4096) replaced with resp.readline() for reliable streaming
+- Fix permission.asked handler crash caused by debug line referencing undefined variable
+- Add confirm card posted/answered logging for diagnostics
+- Add PID file self-management to prevent multiple bridge instances
+- Switch default OpenCode model from glm-5.1 to glm-5.2
+- Add OpenCode auth.json volume mount in docker-compose
+- Update .gitignore to exclude *.bak and bridge.pid

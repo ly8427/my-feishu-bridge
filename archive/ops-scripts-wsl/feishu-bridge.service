@@ -1,0 +1,16 @@
+[Unit]
+Description=Feishu Bridge
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liu
+WorkingDirectory=/home/liu/projects/claudeWorkSpace/feishu-bridge
+Environment=FEISHU_ENV_FILE=/home/liu/.secrets/feishu-bridge.env
+ExecStart=/home/liu/projects/claudeWorkSpace/feishu-bridge/.venv/bin/python3 bridge.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

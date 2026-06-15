@@ -6,6 +6,10 @@
 无需公网 IP：用飞书 **WebSocket 长连接**接收事件。
 双引擎：**Claude Code**（默认）/ **OpenCode**（飞书 `/engine opencode` 切换）。
 
+> **跨平台**：bridge.py 可在 Windows / macOS / Linux / WSL 宿主机上用 `python3`
+> 直接运行（不再强依赖 systemd / bash 专属工具）。统一管理入口是 **`cli.py`**。
+> 让 AI agent 自动部署？读 **[`agent_readme.md`](agent_readme.md)**（环境判定 + 自愈剧本）。
+
 ---
 
 ## 架构
@@ -53,17 +57,16 @@
 ### 凭证存放位置（重要）
 
 **所有敏感信息放在 `~/.secrets/feishu-bridge.env`。** 该目录不在容器挂载区内，
-agent 无法通过 Read 工具读取。systemd 服务通过 `FEISHU_ENV_FILE` 变量指向它。
+agent 无法通过 Read 工具读取。bridge.py 通过 `FEISHU_ENV_FILE` 变量找它
+（未设置时 cli.py 会自动回退到 `~/.secrets/feishu-bridge.env`）。
 
 ```bash
 mkdir -p ~/.secrets
 cp .env.example ~/.secrets/feishu-bridge.env
 chmod 600 ~/.secrets/feishu-bridge.env
 # 编辑 ~/.secrets/feishu-bridge.env，填写真实凭证
+export FEISHU_ENV_FILE=~/.secrets/feishu-bridge.env
 ```
-
-> 如果不用 systemd，也可以直接 `export FEISHU_ENV_FILE=~/.secrets/feishu-bridge.env`
-> 然后启动 `python3 bridge.py`。
 
 ### 配置项说明
 
@@ -106,40 +109,59 @@ OPENCODE_MODEL=your-provider/your-model
 
 ## 部署
 
+> 凭证准备见上方 [配置 → 凭证存放位置](#凭证存放位置重要)。
+
+### 跨平台快速部署（推荐：用 cli.py）
+
+`cli.py` 是统一管理入口，Windows / macOS / Linux 通用，不依赖 bash/systemd：
+
 ```bash
 cd /path/to/feishu-bridge
 
-# 1) 凭证
-mkdir -p ~/.secrets
-cp .env.example ~/.secrets/feishu-bridge.env
-chmod 600 ~/.secrets/feishu-bridge.env
-#    编辑 ~/.secrets/feishu-bridge.env 填入真实凭证
-
-# 2) 宿主机 venv
+# 0) 宿主机 venv（仅需 lark-oapi）
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt        # Windows: .venv\Scripts\pip install ...
 
-# 3) 构建并启动隔离容器
-export $(grep -v '^#' ~/.secrets/feishu-bridge.env | xargs)
-docker compose -f docker/docker-compose.yml up -d --build
+# 1) 凭证（见上一节）
 
-#    验证
-docker exec feishu-claude-agent claude --version      # Claude
-docker exec feishu-claude-agent opencode --version     # OpenCode
+# 2) 一键自检 —— 看 ✓/✗，按提示补齐
+python3 cli.py check
 
-# 4) 启动 bridge
-systemctl --user daemon-reload
-systemctl --user restart feishu-bridge
-systemctl --user status feishu-bridge
+# 3) 构建 + 启 agent 容器（自动把 env 文件变量喂给 compose）
+python3 cli.py up
+
+# 4) 启 bridge（后台）
+python3 cli.py start --detach
+
+# 5) 验证
+python3 cli.py status      # bridge RUNNING + container running
+python3 cli.py check       # 全绿
 ```
 
-看到 `Bridge up. Whitelisted user: ...` 即就绪。
+看到 `Bridge up. Whitelisted user: ...` 即就绪。常用命令：`cli.py status /
+restart / stop / logs / doctor`（详见 `python3 cli.py -h`）。
 
-### systemd 自启
-
-bridge 已注册为 `feishu-bridge.service` 用户服务。
+### 等价的手动步骤（理解原理用）
 
 ```bash
+# 启容器
+docker compose -f docker/docker-compose.yml up -d --build
+# 启 bridge（前台）
+export FEISHU_ENV_FILE=~/.secrets/feishu-bridge.env
+python3 bridge.py
+```
+
+### 开机自启：Linux / WSL（可选，systemd）
+
+bridge.py 本身不依赖 systemd，但在 Linux/WSL 上想让它开机自启、注销不回收，
+可注册为用户服务。**仅 Linux 有 systemd；Windows/macOS 用 Docker Desktop 的
+「开机启动」+ `cli.py start --detach` 即可。**
+
+```bash
+# 安装 unit（把 feishu-bridge.service 放到 ~/.config/systemd/user/，按需改路径）
+systemctl --user daemon-reload
+systemctl --user enable --now feishu-bridge
+
 # 开启 lingering（Windows 注销后服务不回收 —— 只需跑一次）
 sudo loginctl enable-linger $USER
 
@@ -157,10 +179,13 @@ journalctl --user -u feishu-bridge -f       # 实时日志
 ### 手动启动（调试用）
 
 ```bash
+FEISHU_ENV_FILE=~/.secrets/feishu-bridge.env python3 bridge.py
+# 或后台：
 FEISHU_ENV_FILE=~/.secrets/feishu-bridge.env nohup .venv/bin/python3 bridge.py >> bridge.log 2>&1 &
 ```
 
-先停 systemd 服务避免双连接：`systemctl --user stop feishu-bridge`
+若已用 systemd 自启，先 `systemctl --user stop feishu-bridge` 避免双连接
+（bridge.py 有文件锁单实例保护，第二个会拒绝启动）。
 
 ---
 
@@ -224,12 +249,14 @@ OpenCode 引擎通过 `opencode serve` 的 SSE 事件流 + REST API 驱动：
 | 文件 | 作用 |
 |------|------|
 | `bridge.py` | 宿主机：长连接、白名单、docker exec、卡片渲染、确认回调、引擎切换 |
+| `cli.py` | **统一管理入口**（跨平台）：check/up/down/start/stop/status/logs/doctor |
+| `agent_readme.md` | 给 AI agent 的环境自适应指南（判定 + 自愈 + 架构） |
 | `agent_runner.py` | 容器内：Claude Agent SDK + `can_use_tool` 确认 + session resume |
 | `agent_runner_opencode.py` | 容器内：OpenCode serve SSE + permission.asked 拦截 + REST API |
 | `session_store.py` | chat_id → session_id 映射 |
 | `docker/Dockerfile` | 容器镜像：claude CLI + opencode CLI + agent SDK |
 | `docker/docker-compose.yml` | 隔离容器，只挂载 workspace |
-| `wait-for-docker.sh` | 启动前门禁，等待 Docker Desktop socket 就绪 |
+| `wait-for-docker.sh` | 启动前门禁，等待 Docker Desktop socket 就绪（systemd 路径用） |
 | `.env.example` | 配置模板（复制到 `~/.secrets/feishu-bridge.env`） |
 
 ---
