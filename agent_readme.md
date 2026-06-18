@@ -117,14 +117,14 @@ ls -la "${FEISHU_ENV_FILE:-$HOME/.secrets/feishu-bridge.env}"
 # WORKSPACE_DIR 来自 env 文件或环境变量；默认 ~/projects
 python3 -c "import os; d=os.environ.get('WORKSPACE_DIR') or os.path.join(os.path.expanduser('~'),'projects'); print(d); assert os.path.isdir(d) and os.access(d,os.W_OK), 'missing/unwritable'"
 ```
-→ 不满足见 §2.4
+→ 不满足见 §2.5
 
 ### 1.7 agent 容器运行中
 
 ```bash
 docker inspect -f '{{.State.Status}}' feishu-claude-agent    # 期望: running
 ```
-→ 不是 running/不存在 见 §2.5
+→ 不是 running/不存在 见 §2.6
 
 ### 1.8 bridge 进程运行中
 
@@ -134,7 +134,7 @@ python3 cli.py status    # 看 "bridge.py: RUNNING / NOT RUNNING"
 bridge 的存活判定（cli.py 内部逻辑，无需 ps/pgrep）：
 - 先探 advisory lock（新 bridge.py 持有的文件锁）
 - 再回退查 PID 文件里的 PID 是否存活（兼容旧版/systemd 启动的实例）
-→ 不在跑 见 §2.6
+→ 不在跑 见 §2.7
 
 ### 1.9 OpenCode auth（仅 ENGINE=opencode 时需要）
 
@@ -144,7 +144,7 @@ ls -la ~/.local/share/opencode/auth.json
 # 或 env 文件里 OPENCODE_AUTH_FILE 指定的路径
 ```
 - 若 `ENGINE=claude`（默认），此项跳过。
-→ 缺失见 §2.7
+→ 缺失见 §2.8
 
 ---
 
@@ -158,15 +158,16 @@ agent 可解析它的 `FIX →` 行直接执行。下面是详细剧本。
 1. python3 cli.py check                 # 看缺什么 → §2.1/§2.2
 2. cp .env.example ~/.secrets/feishu-bridge.env  &&  编辑填真实值
    （必填 FEISHU_APP_ID / FEISHU_APP_SECRET / ALLOWED_USER_ID / WORKSPACE_DIR；
-     Claude 引擎还要 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN）→ §2.3/§2.4
-3. export FEISHU_ENV_FILE="$HOME/.secrets/feishu-bridge.env"   # 必做！见 §2.3
-   （opencode 引擎另需 export OPENCODE_AUTH_FILE=绝对路径 → §2.7）
-4. python3 cli.py up                    # 建容器（首次 5-10 分钟）→ §2.5
-5. python3 cli.py start --detach        # 启 bridge → §2.6
-6. python3 cli.py check                 # 期望全 ✓
-7. 飞书发一条消息做端到端验证 → §4
+     Claude 引擎还要 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN）→ §2.3/§2.5
+3. 飞书开放平台：开权限 + 加机器人能力 + 订阅事件 + 发布版本 → §2.4（必做！）
+4. export FEISHU_ENV_FILE="$HOME/.secrets/feishu-bridge.env"   # 必做！见 §2.3
+   （opencode 引擎另需 export OPENCODE_AUTH_FILE=绝对路径 → §2.8）
+5. python3 cli.py up                    # 建容器（首次 5-10 分钟）→ §2.6
+6. python3 cli.py start --detach        # 启 bridge → §2.7
+7. python3 cli.py check                 # 期望全 ✓
+8. 飞书发一条消息做端到端验证 → §4
 ```
-> 第 3 步的 export 只对当前 shell 有效；长期运行请写进 shell profile 或
+> 第 4 步的 export 只对当前 shell 有效；长期运行请写进 shell profile 或
 > systemd unit（见 §2.3 末尾），否则重启后 bridge 又会 Missing .env。
 
 ### 2.1 Python 缺失 / 版本过低
@@ -222,6 +223,67 @@ chmod 600 ~/.secrets/feishu-bridge.env        # Linux/macOS；Windows 用 ACL
 | `FEISHU_APP_SECRET` | 同上 |
 | `ALLOWED_USER_ID` | 你的飞书 open_id。先随便填一个值启动 bridge，给机器人发条消息，看 `bridge.log` 里 `IGNORED ... sender: ou_xxx`，把 `ou_...` 填回 |
 
+> ⚠️ 拿到 APP_ID/SECRET 不够——还要在飞书开放平台**开权限、加机器人能力、配事件
+> 订阅**，否则机器人收不到消息或回不了卡片。见 **§2.4**。
+
+### 2.4 飞书应用配置（权限 / 事件订阅 / 机器人能力）
+
+光有 APP_ID/SECRET，机器人是哑的。下列三项**全在飞书开放平台**（
+https://open.feishu.cn/app ）你的自建应用里配置。下面每项都标注了对应的代码调用，
+方便核对为什么需要它。
+
+**① 开通权限（权限管理 → 找到下列 scope → 开通 → 申请范围选「全部成员」或自建测试用）**
+
+bridge.py 至少用到这些 API，缺一个对应 scope 就会 403/收不到事件：
+
+| 权限 scope | 作用 | 对应代码 |
+|------------|------|---------|
+| `im:message` | **接收用户发给机器人的消息**（核心） | `register_p2_im_message_receive_v1` |
+| `im:message:send_as_bot` | 机器人**发消息/卡片**给用户 | `im.v1.message.create` |
+| `im:resource` | 读取消息里的图片/文件（若 agent 要看附件） | `im.v1.message` 解码 |
+| `card:interaction` | **卡片按钮回调**（确认卡的 ✅/❌） | `register_p2_card_action_trigger` |
+| `im:chat` | （可选）多人群聊场景读会话信息 | `im.v1.chat` |
+
+> 飞书改版频繁，scope 显示名可能是中文（如「获取与发送单聊、群组消息」「机器人获取
+> 用户发给机器人的单聊消息」）。认准上面 scope key，搜不到就用 key 在权限列表搜。
+> 企业自建应用默认无需审核即可开通；如需审批，发布到应用市场才需要管理员审批。
+
+**② 添加「机器人」能力（应用功能 → 机器人 → 添加）**
+
+没有机器人能力，用户在飞书里搜不到也 @ 不到你的应用，消息事件不会触发。
+添加后保存默认配置即可（机器人名称/描述可自定义）。
+
+**③ 事件订阅（应用功能 → 事件订阅）**
+
+bridge.py 用 **WebSocket 长连接**接收事件（`lark.ws.Client` + `ws.start()`），
+所以：
+- **无需公网 IP / 无需回调地址**（这是长连接模式的最大好处）。
+- 但仍要在事件订阅页**订阅下列事件**，否则事件根本不会推给长连接：
+  - `接收消息 v2.0`（事件 key：`im.message.receive_v1`）—— 用户发消息给机器人
+  - `卡片交互回调` / `Card Action Trigger`（事件 key：`card.action.trigger`）——
+    确认卡按钮点击
+- 订阅模式选 **「使用长连接接收事件」**（不要选「将事件发送至开发者服务器」，
+  那是 webhook 模式，需要公网回调地址）。
+
+**④ 发布版本（版本管理与发布 → 创建版本 → 申请发布）**
+
+自建应用对**自己/本企业**生效，通常免审。但**权限和事件订阅的修改需发布新版本
+才生效**。改完上面 ①②③ 后，务必创建并发布一个新版本（哪怕版本号只 +1）。
+发布后等几秒到几十秒，长连接会重新拉取权限。
+
+**验证是否配通（容器/bridge 还没跑也行，纯看配置）：**
+- 回到应用首页，确认权限页 5 个 scope 都是「已开通」。
+- 事件订阅页，`im.message.receive_v1` 和 `card.action.trigger` 都已订阅。
+- 应用功能页有「机器人」且状态正常。
+- 最新版本已发布。
+
+> 常见症状对照：
+> - 机器人能收消息但回不了 → 漏 `im:message:send_as_bot` 或没发布版本。
+> - 确认卡点 ✅ 完全无反应 → 漏 `card:interaction` 权限或没订阅
+>   `card.action.trigger`（§5「确认卡点了没反应」即此根因）。
+> - bridge.log 反复 `recv error / 重连失败` → 事件订阅选成了 webhook 模式，
+>   改回长连接。
+
 **让 cli.py / bridge.py 找到凭证（必做，不是可选项）：**
 ```bash
 export FEISHU_ENV_FILE="$HOME/.secrets/feishu-bridge.env"
@@ -245,7 +307,7 @@ profile 或 systemd unit 的 `Environment=`/`EnvironmentFile=`。
 > WorkingDirectory=/path/to/feishu-bridge
 > ```
 
-### 2.4 WORKSPACE_DIR 缺失/不可写
+### 2.5 WORKSPACE_DIR 缺失/不可写
 
 `WORKSPACE_DIR` 是 agent 容器能操作的**唯一**目录（你的真实代码目录）。
 在 env 文件里设置，例如：
@@ -260,10 +322,10 @@ WORKSPACE_DIR=/home/$USER/projects          # Linux/WSL
 挂载会失败（挂一个不存在的宿主目录）。同时 `ENGINE=claude`（默认）下别忘填
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`。
 
-⚠️ 改了 WORKSPACE_DIR 后，**必须重建容器**（§2.5 的 `up`），因为挂载是
+⚠️ 改了 WORKSPACE_DIR 后，**必须重建容器**（§2.6 的 `up`），因为挂载是
 compose 启动时确定的。
 
-### 2.5 agent 容器未跑
+### 2.6 agent 容器未跑
 
 ```bash
 python3 cli.py up    # = docker compose -f docker/docker-compose.yml up -d --build
@@ -282,7 +344,7 @@ docker exec feishu-claude-agent python3 /app/agent_runner_opencode.py --help # O
 python3 cli.py check      # "Agent container" 行应为 ✓ running
 ```
 
-### 2.6 bridge 未跑
+### 2.7 bridge 未跑
 
 ```bash
 python3 cli.py start --detach    # 后台启动，日志写 bridge.log
@@ -293,7 +355,7 @@ python3 cli.py start             # Ctrl-C 停止
 ⚠️ **不要同时跑两个 bridge**。bridge.py 用文件锁保证单实例，第二个会拒绝启动。
 若误判卡住：`python3 cli.py stop` 停干净再 start。
 
-### 2.7 OpenCode auth.json 缺失（仅 opencode 引擎）
+### 2.8 OpenCode auth.json 缺失（仅 opencode 引擎）
 
 OpenCode 引擎需要 provider 认证文件，与 API_KEY 不同。在**宿主机**跑一次：
 ```bash
@@ -429,7 +491,7 @@ docker logs feishu-claude-agent
 │   2. 确认启动 bridge 的 shell/systemd unit export 了 FEISHU_ENV_FILE
 │      （bridge.py _load_env 只认 $FEISHU_ENV_FILE 和 ./.env，不回退 ~/.secrets）
 │   3. 重启 bridge 让它重新加载：python3 cli.py restart
-├─ OpenCode: permission denied / auth → §2.7 auth.json
+├─ OpenCode: permission denied / auth → §2.8 auth.json
 └─ 容器反复重启 → docker inspect 看挂载路径是否存在于宿主机
 ```
 
