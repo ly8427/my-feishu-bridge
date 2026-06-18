@@ -158,7 +158,9 @@ bridge.py 本身不依赖 systemd，但在 Linux/WSL 上想让它开机自启、
 「开机启动」+ `cli.py start --detach` 即可。**
 
 ```bash
-# 安装 unit（把 feishu-bridge.service 放到 ~/.config/systemd/user/，按需改路径）
+# 安装 unit（仓库附带 deploy/feishu-bridge.service；拷过去，按需改其中的仓库路径）
+mkdir -p ~/.config/systemd/user
+cp deploy/feishu-bridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now feishu-bridge
 

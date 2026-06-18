@@ -1,0 +1,42 @@
+# systemd USER unit for the feishu-bridge host process.
+#
+# Install (Linux / WSL2 with systemd enabled):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/feishu-bridge.service ~/.config/systemd/user/
+#   # edit the repo path below if you cloned my-feishu-bridge somewhere else
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now feishu-bridge
+#   sudo loginctl enable-linger "$USER"        # survive logout / start at boot
+#
+# All secrets are read from FEISHU_ENV_FILE by bridge.py's _load_env(), so this
+# unit stays secret-free — copy it as-is.
+#
+# The agent container (feishu-claude-agent) is managed separately by Docker
+# Desktop (restart: unless-stopped) and comes back on its own; the bridge only
+# talks to it at turn time via `docker exec`.
+
+[Unit]
+Description=Feishu <-> AI Bridge (host process)
+Documentation=https://github.com/ly8427/my-feishu-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h expands to the user's home dir in a user unit. If you cloned the repo to a
+# different folder, change %h/my-feishu-bridge below (and in ExecStart).
+WorkingDirectory=%h/my-feishu-bridge
+Environment=FEISHU_ENV_FILE=%h/.secrets/feishu-bridge.env
+Environment=HOME=%h
+# User services get a minimal PATH; pin one that includes docker (the Docker
+# Desktop WSL symlink lives in /usr/bin) so bridge.py's `docker exec` resolves.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+ExecStart=%h/my-feishu-bridge/.venv/bin/python %h/my-feishu-bridge/bridge.py
+# Restart only on crash (non-zero). bridge.py exits 0 on SIGTERM/SIGINT, so a
+# deliberate `systemctl --user stop` / shutdown is honoured (no respawn loop).
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

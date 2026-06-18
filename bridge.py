@@ -535,13 +535,24 @@ def _ensure_single_instance() -> None:
 
 
 def _on_stop_signal(signum, _frame) -> None:
-    """Graceful-stop hook for SIGINT/SIGTERM (both exist on Win/Mac/Linux).
+    """Hard-stop hook for SIGINT/SIGTERM (both exist on Win/Mac/Linux).
 
-    We only flag intent + log; lark's ws.start() blocks and will unwind via the
-    KeyboardInterrupt that CPython raises out of a signal-interrupted recv().
-    Registering SIGTERM also means systemd/docker stop deliver a clean exit.
+    We must exit explicitly. lark's ws.start() blocks on a socket recv and does
+    NOT unwind when we install our own handler: registering replaces the
+    default action (terminate on SIGTERM / raise KeyboardInterrupt on SIGINT),
+    so merely logging here leaves the process — and its singleton lock — alive
+    forever. That is exactly why `cli.py stop` kept reporting
+    "lock still held after 5s".
+
+    Release the singleton lock so a fresh instance can start immediately, then
+    hard-exit. The OS also frees the fcntl advisory lock on process death, and
+    the daemon drain/render threads die with the process.
     """
     log.info("Received signal %s — shutting down bridge", signum)
+    try:
+        _release_singleton_lock()
+    finally:
+        os._exit(0)
 
 
 def main() -> None:
