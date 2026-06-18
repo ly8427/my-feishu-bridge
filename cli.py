@@ -462,19 +462,38 @@ def cmd_stop(args) -> int:
     except (ProcessLookupError, PermissionError) as exc:
         _fail(f"could not stop bridge PID {pid}: {exc}")
         return 1
-    # Wait for the lock to release (bridge atexit clears it).
-    for _ in range(50):  # up to ~5s
+    # Wait for the lock to release (bridge exits + atexit clears it on SIGTERM).
+    for _ in range(50):  # up to ~5s grace
         if not _bridge_running():
             _ok(f"bridge stopped (was PID {pid})")
             return 0
         time.sleep(0.1)
-    _warn(f"bridge PID {pid} sent SIGTERM but lock still held after 5s — may need a second stop.")
+    # SIGTERM didn't land within the grace window — escalate so stop/restart
+    # always succeed even if the bridge is wedged (e.g. mid-turn). SIGKILL is
+    # Unix-only; on Windows fall back to SIGTERM (maps to TerminateProcess).
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    _warn(f"bridge PID {pid} did not exit on SIGTERM after 5s — escalating to SIGKILL")
+    try:
+        os.kill(pid, sigkill)
+    except (ProcessLookupError, PermissionError) as exc:
+        _fail(f"could not stop bridge PID {pid}: {exc}")
+        return 1
+    for _ in range(50):  # wait for the OS to reap it and free the lock
+        if not _bridge_running():
+            _ok(f"bridge stopped (was PID {pid})")
+            return 0
+        time.sleep(0.1)
+    _fail(f"bridge PID {pid} still alive after SIGKILL — inspect manually")
     return 1
 
 
 def cmd_restart(args) -> int:
     rc1 = cmd_stop(args)
     time.sleep(1)
+    # restart always backgrounds the new bridge (there's no tty to hold it).
+    # The `restart` subparser intentionally has no --detach flag, so set it
+    # explicitly — otherwise cmd_start's `args.detach` raises AttributeError.
+    args.detach = True
     rc2 = cmd_start(args)
     return rc2 if rc1 == 0 else rc1
 
