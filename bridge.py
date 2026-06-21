@@ -96,6 +96,67 @@ logging.basicConfig(
 log = logging.getLogger("bridge")
 
 
+class _RedactFilter(logging.Filter):
+    """Scrub credentials from every log line before it reaches any handler.
+
+    The lark SDK logs the live WebSocket URL on every (re)connect, and that URL
+    carries `access_key` + `ticket` as query params — i.e. real, reusable auth
+    that lets anyone impersonate this bot. bridge.log lives inside the agent's
+    mounted workspace and Read is auto-approved, so without this filter a
+    prompt-injected agent could exfiltrate the connection credentials via the
+    log file. Redact at the record level so ALL handlers (console + file) are
+    covered with one filter, and match defensively (token prefixes, query
+    params, open_id values).
+
+    Exception: lines starting with "IGNORED ..." keep the full open_id. Those
+    lines exist ONLY to tell the operator the sender's open_id during first-time
+    whitelist setup (see agent_readme §2.3 — "发条消息, 看 bridge.log 里 IGNORED
+    ... sender: ou_xxx, 把 ou_... 填回"). Redacting the ou_ there defeats the
+    feature; access_key/ticket/tokens are still scrubbed on every line.
+    """
+    import re as _re
+    # Always-on secrets: real reusable credentials. Scrubbed on every line.
+    _SECRETS = _re.compile(
+        r"("
+        r"access_key=[A-Za-z0-9]+"          # feishu WS connection credential
+        r"|ticket=[A-Za-z0-9-]+"            # feishu WS connection ticket
+        r"|app_secret=[A-Za-z0-9]+"         # feishu app secret if ever logged
+        r"|(?:FEISHU_APP_SECRET|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY)=[A-Za-z0-9_\-]+"
+        r"|sk-[A-Za-z0-9]{6,}"              # any Anthropic/relay bearer token
+        r")"
+    )
+    # PII: open_id values. Scrubbed on routine lines, KEPT on IGNORED setup lines.
+    _OPENID = _re.compile(r"ou_[A-Za-z0-9]{20,}")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        # Secrets are always redacted.
+        out = self._SECRETS.sub(
+            lambda m: m.group(0).split("=", 1)[0] + "=***", msg
+        )
+        # open_id is redacted EXCEPT on the "IGNORED ..." setup-assist lines,
+        # where the whole point of the log entry is to surface the sender's id.
+        is_setup_line = out.lstrip().startswith("IGNORED ")
+        if not is_setup_line:
+            out = self._OPENID.sub("ou_***", out)
+        if out != msg:
+            record.msg = out
+            record.args = ()
+        return True
+
+
+logging.getLogger().addFilter(_RedactFilter())
+# A logger-level filter only fires when a record originates at THAT logger.
+# The lark SDK emits its `connected to wss://...access_key=...` line from its
+# own "Lark" logger; even though it propagates up to root, the filter on root
+# is NOT re-checked during propagation. To cover records from any sub-logger
+# (lark, asyncio, etc.), attach the filter to every HANDLER too — a handler
+# filter is applied to every record that passes through it regardless of origin.
+_redact = _RedactFilter()
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_redact)
+
+
 
 import session_store  # local module
 
@@ -303,6 +364,14 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
         resume = None
     # Forward whichever Claude auth vars are set on the host. This machine uses
     # a relay (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN); an official key works too.
+    # claude-code CLI (>=2.1.x) authenticates ONLY via ANTHROPIC_API_KEY (or
+    # apiKeyHelper) — it ignores ANTHROPIC_AUTH_TOKEN entirely, yielding
+    # "Not logged in" / apiKeySource:none in stream-json mode. Relay setups put
+    # the bearer in ANTHROPIC_AUTH_TOKEN, so mirror it into ANTHROPIC_API_KEY
+    # when the latter is unset. The deepseek /anthropic endpoint accepts the
+    # same value as an x-api-key header.
+    if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
     cmd = ["docker", "exec", "-i"]
     for var in _CLAUDE_FORWARD_VARS:
         if os.environ.get(var):
@@ -332,6 +401,7 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
         ]
     if resume:
         cmd += ["--resume", resume]
+
 
     _passthrough_vars = _CLAUDE_FORWARD_VARS + (
         "PATH", "HOME", "DOCKER_HOST", "TERM",
