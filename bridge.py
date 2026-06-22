@@ -68,6 +68,72 @@ CONFIRM_TIMEOUT = os.environ.get("CONFIRM_TIMEOUT", "300")
 SAFE_TOOLS = os.environ.get("SAFE_TOOLS", "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookRead")
 DEFAULT_ENGINE = os.environ.get("ENGINE", "claude")
 
+
+# ---------------------------------------------------------------- provider table
+def _parse_providers() -> tuple[dict[str, dict], str]:
+    """Build a provider config table from PROVIDERS + <NAME>_BASE_URL/API_KEY/MODELS env vars.
+
+    Falls back to a single implicit provider from the legacy ANTHROPIC_* vars if
+    PROVIDERS is unset, preserving backward compatibility.
+    """
+    table: dict[str, dict] = {}
+    names_str = os.environ.get("PROVIDERS", "")
+    if names_str:
+        names = [n.strip() for n in names_str.split(",") if n.strip()]
+        for name in names:
+            prefix = name.upper()
+            base_url = os.environ.get(f"{prefix}_BASE_URL", "")
+            api_key = os.environ.get(f"{prefix}_API_KEY", "")
+            models_str = os.environ.get(f"{prefix}_MODELS", "")
+            models = [m.strip() for m in models_str.split(",") if m.strip()]
+            table[name] = {"base_url": base_url, "api_key": api_key, "models": models}
+    else:
+        # Backward compat: derive a single "default" provider from ANTHROPIC_* vars.
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+        api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY", "")
+        model = os.environ.get("ANTHROPIC_MODEL", "")
+        models = [model] if model else []
+        table["default"] = {"base_url": base_url, "api_key": api_key, "models": models}
+
+    default_name = os.environ.get("DEFAULT_PROVIDER", "")
+    if default_name not in table:
+        default_name = next(iter(table), "")
+    return table, default_name
+
+
+_PROVIDERS, _DEFAULT_PROVIDER = _parse_providers()
+
+
+def _apply_provider(name: str, chat_id: str = "") -> None:
+    """Inject a provider's credentials into os.environ as ANTHROPIC_* vars.
+
+    This lets the existing _CLAUDE_FORWARD_VARS forwarding logic work unchanged —
+    it reads ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN from
+    os.environ, so we just overwrite those before each turn.
+    """
+    prov = _PROVIDERS.get(name)
+    if not prov:
+        return
+    if prov["base_url"]:
+        os.environ["ANTHROPIC_BASE_URL"] = prov["base_url"]
+    if prov["api_key"]:
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = prov["api_key"]
+        os.environ["ANTHROPIC_API_KEY"] = prov["api_key"]
+    # If user has a per-chat model override, keep it; otherwise use provider default
+    if chat_id and _chat_model.get(chat_id):
+        os.environ["ANTHROPIC_MODEL"] = _chat_model[chat_id]
+    elif prov["models"]:
+        os.environ["ANTHROPIC_MODEL"] = prov["models"][0]
+
+
+# per-chat state: engine, provider, model overrides (in-memory, process lifetime)
+_chat_engine: dict[str, str] = {}
+_chat_provider: dict[str, str] = {}
+_chat_model: dict[str, str] = {}
+
+# Apply default provider at startup so the first turn uses correct credentials.
+_apply_provider(_DEFAULT_PROVIDER)
+
 # Anthropic/Claude-Code env vars forwarded into the agent container when the
 # claude engine runs. Auth (BASE_URL/AUTH_TOKEN/API_KEY) is always relevant;
 # the MODEL* and CLAUDE_CODE* vars let a relay-compatible endpoint pin which
@@ -370,6 +436,10 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     # the bearer in ANTHROPIC_AUTH_TOKEN, so mirror it into ANTHROPIC_API_KEY
     # when the latter is unset. The deepseek /anthropic endpoint accepts the
     # same value as an x-api-key header.
+    # Apply per-chat provider and model overrides BEFORE building the docker exec
+    # command, so the -e flags pick up the right BASE_URL/API_KEY/MODEL.
+    provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
+    _apply_provider(provider, chat_id)
     if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
         os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
     cmd = ["docker", "exec", "-i"]
@@ -431,8 +501,119 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     # Splitting these is what stops a slow lark HTTP call from back-pressuring
     # the agent's stdout (the root cause of multi-minute stalls).
     threading.Thread(target=_drain_job, args=(job,), daemon=True).start()
-    log.info("turn started: engine=%s threads=drain+render", engine)
+    _prov = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
+    _mdl = _chat_model.get(chat_id) or os.environ.get("ANTHROPIC_MODEL", "?")
+    log.info("turn started: engine=%s provider=%s model=%s", engine, _prov, _mdl)
     threading.Thread(target=_render_loop, args=(job,), daemon=True).start()
+
+
+# ---------------------------------------------------------------- slash command helpers
+def _help_text() -> str:
+    return (
+        "📖 **可用命令**\n\n"
+        "`/new`, `/reset` — 清除会话,开启新对话\n"
+        "`/sessions` — 列出所有历史会话\n"
+        "`/resume <N|id>` — 恢复指定会话\n"
+        "`/provider [name]` — 查看/切换厂商\n"
+        "`/model [name]` — 查看/切换模型\n"
+        "`/engine <name>` — 切换引擎 (claude/opencode)\n"
+        "`/help` — 显示此帮助\n\n"
+        "直接发消息即与 AI 对话"
+    )
+
+
+# Cache for session listing to support /resume <序号>
+_session_list_cache: dict[str, list[dict]] = {}
+
+
+def _handle_sessions_cmd(chat_id: str) -> None:
+    """List Claude sessions from the container via agent_runner --list-sessions."""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", feishu_claude_agent_name(), "python3", "/app/agent_runner.py", "--list-sessions"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            err = result.stdout.strip()[:500] or result.stderr.strip()[:500]
+            _post_card(chat_id, f"❌ 查询会话失败:\n```\n{err}\n```")
+            return
+        sessions = json.loads(result.stdout.strip())
+        if not sessions:
+            _post_card(chat_id, "📂 暂无历史会话。\n发条消息开始第一次对话吧。")
+            return
+        # Cache for /resume <序号>
+        _session_list_cache[chat_id] = sessions
+        # Build display
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        current = session_store.get(f"{engine}:{chat_id}")
+        lines = [f"📂 **会话列表** ({len(sessions)} 个)", ""]
+        for i, s in enumerate(sessions, 1):
+            sid = s.get("session_id", "?")
+            sid_short = sid[:13] + "..." if len(sid) > 16 else sid
+            ts = s.get("updated_at", s.get("created_at", "?"))
+            title = s.get("title", "")
+            marker = " ← 当前" if sid == current else ""
+            line = f"{i}. `{sid_short}` | {ts}"
+            if title:
+                line += f" | {title}"
+            line += marker
+            lines.append(line)
+        lines.append("")
+        if current:
+            lines.append(f"当前活跃: `{current[:13]}...`")
+        lines.append("用 `/resume <序号或session_id>` 恢复")
+        _post_card(chat_id, "\n".join(lines))
+    except subprocess.TimeoutExpired:
+        _post_card(chat_id, "❌ 查询超时(30s),请稍后重试")
+    except Exception as e:
+        _post_card(chat_id, f"❌ 查询出错: {e}")
+
+
+def _handle_resume_cmd(chat_id: str, arg: str) -> None:
+    """Resume a session by sequence number or full session_id."""
+    if arg.lower() == "clear":
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        session_store.clear(f"{engine}:{chat_id}")
+        _post_card(chat_id, "✅ 已清除会话恢复,下条消息将开启新会话。")
+        return
+
+    # Determine target session_id
+    target_sid = None
+    if arg.isdigit():
+        idx = int(arg) - 1
+        sessions = _session_list_cache.get(chat_id, [])
+        if 0 <= idx < len(sessions):
+            target_sid = sessions[idx].get("session_id")
+        else:
+            _post_card(chat_id, f"❌ 序号 {arg} 超出范围。先用 `/sessions` 查看列表。")
+            return
+    else:
+        target_sid = arg.strip()
+        # If the provided ID is shorter than a full UUID, try prefix-matching
+        # against cached sessions. This handles cases where the user copied a
+        # truncated ID from the /sessions card display.
+        if len(target_sid) < 36:
+            sessions = _session_list_cache.get(chat_id, [])
+            matches = [s["session_id"] for s in sessions
+                       if s.get("session_id", "").startswith(target_sid)]
+            if len(matches) == 1:
+                target_sid = matches[0]
+            elif len(matches) > 1:
+                _post_card(chat_id, f"❌ ID 前缀 `{target_sid}` 匹配了 {len(matches)} 个会话，请提供更完整的 ID。")
+                return
+
+    if not target_sid:
+        _post_card(chat_id, "❌ 无效的 session_id")
+        return
+
+    engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+    session_store.put(f"{engine}:{chat_id}", target_sid)
+    sid_short = target_sid[:13] + "..." if len(target_sid) > 16 else target_sid
+    _post_card(chat_id, f"✅ 已设置会话恢复: `{sid_short}`\n下条消息将从该会话继续。")
+
+
+def feishu_claude_agent_name() -> str:
+    return CONTAINER_NAME
 
 
 # ---------------------------------------------------------------- event handlers
@@ -456,13 +637,17 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     if not text:
         return
 
-    # simple slash commands
+    # ---- slash commands ----
     if text in ("/new", "/reset"):
-        # Clear sessions for both engines (keys are namespaced).
         session_store.clear(f"claude:{chat_id}")
         session_store.clear(f"opencode:{chat_id}")
         _card_workers.submit(_post_card, chat_id, "🧹 已清除会话上下文,下条消息将开启新会话。")
         return
+
+    if text == "/help":
+        _card_workers.submit(_post_card, chat_id, _help_text())
+        return
+
     if text.startswith("/engine "):
         eng = text.split(" ", 1)[1].strip().lower()
         if eng in ("claude", "opencode"):
@@ -472,6 +657,74 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             _card_workers.submit(_post_card, chat_id, f"⚙️ 引擎已切换: {eng}")
         else:
             _card_workers.submit(_post_card, chat_id, f"未知引擎: {eng}。可用: claude / opencode")
+        return
+
+    if text == "/provider" or text.startswith("/provider "):
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            # Show current provider + available list
+            cur = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
+            lines = [f"🏢 **厂商管理**", f"当前: `{cur}`", "", "**可用厂商:**"]
+            for name, prov in _PROVIDERS.items():
+                models = ", ".join(prov["models"]) or "(未配置)"
+                marker = " ← 当前" if name == cur else ""
+                lines.append(f"  • `{name}` (模型: {models}){marker}")
+            lines.append("")
+            lines.append("用 `/provider <name>` 切换")
+            lines.append("⚠️ 切换厂商会清除当前会话(不同厂商 API 不兼容)")
+            _card_workers.submit(_post_card, chat_id, "\n".join(lines))
+        else:
+            name = parts[1].strip().lower()
+            if name in _PROVIDERS:
+                _chat_provider[chat_id] = name
+                # Clear session: different providers have incompatible APIs
+                session_store.clear(f"claude:{chat_id}")
+                session_store.clear(f"opencode:{chat_id}")
+                # Reset per-chat model so the new provider's default kicks in
+                _chat_model.pop(chat_id, None)
+                prov = _PROVIDERS[name]
+                models = ", ".join(prov["models"]) or "(未配置)"
+                _card_workers.submit(
+                    _post_card, chat_id,
+                    f"🏢 厂商已切换: `{name}`\n模型: {models}\n会话已清除。\n用 `/model` 查看可选模型。"
+                )
+            else:
+                available = ", ".join(_PROVIDERS.keys())
+                _card_workers.submit(_post_card, chat_id, f"未知厂商: `{name}`。可用: {available}")
+        return
+
+    if text == "/model" or text.startswith("/model "):
+        parts = text.split(None, 1)
+        provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
+        prov = _PROVIDERS.get(provider, {})
+        cur_model = _chat_model.get(chat_id) or os.environ.get("ANTHROPIC_MODEL", "?")
+        if len(parts) < 2:
+            # Show current model + available list for current provider
+            lines = [f"🤖 **模型管理**", f"厂商: `{provider}`", f"当前: `{cur_model}`", "", "**可用模型:**"]
+            for m in prov.get("models", []):
+                marker = " ← 当前" if m == cur_model else ""
+                lines.append(f"  • `{m}`{marker}")
+            lines.append("")
+            lines.append("用 `/model <name>` 切换")
+            lines.append("也可输入其他模型名自定义")
+            _card_workers.submit(_post_card, chat_id, "\n".join(lines))
+        else:
+            model_name = parts[1].strip()
+            _chat_model[chat_id] = model_name
+            _card_workers.submit(_post_card, chat_id, f"🤖 模型已切换: `{model_name}`")
+        return
+
+    if text == "/sessions":
+        _card_workers.submit(_handle_sessions_cmd, chat_id)
+        return
+
+    if text.startswith("/resume"):
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            _card_workers.submit(_post_card, chat_id, "用法: `/resume <序号或session_id>`\n先用 `/sessions` 查看列表\n或 `/resume clear` 清除恢复")
+        else:
+            arg = parts[1].strip()
+            _card_workers.submit(_handle_resume_cmd, chat_id, arg)
         return
 
     log.info("turn from %s in %s: %s", sender_id, chat_id, text[:80])
