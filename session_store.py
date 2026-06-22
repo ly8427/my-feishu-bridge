@@ -21,6 +21,12 @@ def get(chat_id: str) -> str | None:
         return _load().get(chat_id)
 
 
+def list_all() -> dict[str, str]:
+    """Return all stored key->session_id pairs (copy)."""
+    with _lock:
+        return dict(_load())
+
+
 def put(chat_id: str, session_id: str) -> None:
     with _lock:
         data = _load()

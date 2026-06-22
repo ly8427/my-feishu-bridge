@@ -26,3 +26,9 @@ bridge.pid
 
 # Local dev scripts (contain host-specific paths)
 start_bridge_safe.sh
+
+# AI agent instructions (auto-generated, not for commit)
+CLAUDE.md
+
+# Investigation / debug scripts (not production code)
+scripts/

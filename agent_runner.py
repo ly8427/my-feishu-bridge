@@ -278,11 +278,74 @@ async def run(prompt: str, resume: str | None) -> int:
         stdin_task.cancel()
 
 
+def _list_sessions() -> int:
+    """List all sessions for the workspace directory and print as JSON array.
+
+    Uses the Claude Agent SDK's session storage to enumerate transcripts.
+    Each entry: {session_id, created_at, updated_at, message_count}
+    """
+    cwd = os.environ.get("WORKSPACE_DIR", os.getcwd())
+    try:
+        from claude_agent_sdk import list_sessions
+        sessions = list_sessions(directory=cwd)
+        result = []
+        # SDKSessionInfo fields: session_id, summary, last_modified (int epoch),
+        # file_size, custom_title, first_prompt, git_branch, cwd, tag, created_at (int epoch)
+        from datetime import datetime, timezone
+        def _ts_to_str(ts):
+            """Convert epoch timestamp to YYYY-MM-DD HH:MM string.
+            SDK returns milliseconds; detect and divide if > 1e12."""
+            if not ts:
+                return ""
+            if ts > 1e12:  # milliseconds
+                ts = ts / 1000
+            try:
+                return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, OSError):
+                return ""
+        for s in sessions or []:
+            sid = getattr(s, "session_id", None)
+            if not sid:
+                continue
+            created = getattr(s, "created_at", None)
+            modified = getattr(s, "last_modified", None)
+            created_str = _ts_to_str(created)
+            modified_str = _ts_to_str(modified)
+            # Use first_prompt as a title hint (truncated)
+            title = (getattr(s, "first_prompt", None) or getattr(s, "summary", None) or "")[:60]
+            entry = {
+                "session_id": sid,
+                "created_at": created_str,
+                "updated_at": modified_str,
+                "title": title,
+                "cwd": getattr(s, "cwd", None),
+            }
+            result.append(entry)
+        # Sort by last_modified descending (most recent first)
+        result.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        # Emit a JSON error so the bridge can display it cleanly
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
+        return 1
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prompt", required=True)
+    # --prompt is required UNLESS --list-sessions is given
+    ap.add_argument("--prompt", default=None)
     ap.add_argument("--resume", default=None)
+    ap.add_argument("--list-sessions", action="store_true",
+                    help="List all sessions for the workspace and exit (JSON output)")
     args = ap.parse_args()
+
+    if args.list_sessions:
+        sys.exit(_list_sessions())
+
+    if not args.prompt:
+        ap.error("--prompt is required (unless --list-sessions is used)")
+
     rc = asyncio.run(run(args.prompt, args.resume or None))
     sys.exit(rc)
 
