@@ -878,6 +878,31 @@ def _on_stop_signal(signum, _frame) -> None:
         os._exit(0)
 
 
+def _patch_websockets_no_native_ping() -> None:
+    """Disable websockets library's native WS-level ping/pong.
+
+    The lark SDK maintains its own protobuf-frame ping loop (_ping_loop), so the
+    websockets library's built-in ping is redundant. Worse, the Feishu WS server
+    does NOT respond to RFC 6455 ping frames, so websockets' ping times out after
+    20s and forcibly closes the connection ('keepalive ping timeout'). We disable
+    it by patching the defaults of websockets.connect.
+    """
+    try:
+        import websockets
+        _orig_connect = websockets.connect
+
+        def _patched_connect(uri, **kwargs):
+            # Only override if caller didn't set these explicitly
+            kwargs.setdefault("ping_interval", None)
+            kwargs.setdefault("ping_timeout", None)
+            return _orig_connect(uri, **kwargs)
+
+        websockets.connect = _patched_connect
+        log.info("Patched websockets.connect: native WS ping disabled")
+    except Exception as e:
+        log.warning("Failed to patch websockets (non-fatal): %s", e)
+
+
 def main() -> None:
     _ensure_single_instance()
     # SIGINT (Ctrl-C) works everywhere; SIGTERM lets systemd `stop` and
@@ -891,9 +916,38 @@ def main() -> None:
         .register_p2_card_action_trigger(on_card_action)
         .build()
     )
-    ws = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
+
+    # Disable the websockets library's native ping — it's the root cause of the
+    # recurring 'keepalive ping timeout' disconnects (Feishu server ignores
+    # RFC 6455 pings; the lark SDK uses its own protobuf ping instead).
+    _patch_websockets_no_native_ping()
+
     log.info("Bridge up. Whitelisted user: %s | container: %s", ALLOWED_USER_ID, CONTAINER_NAME)
-    ws.start()  # blocks, maintains the long connection
+
+    # The lark SDK's reconnect loop is bounded by a server-controlled
+    # ReconnectCount. When retries are exhausted it raises
+    # ServerUnreachableException and ws.start() never returns. We wrap it in an
+    # outer loop so the bridge re-establishes a fresh connection forever.
+    import time as _time
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            ws = lark.ws.Client(
+                APP_ID, APP_SECRET,
+                event_handler=handler, log_level=lark.LogLevel.INFO,
+            )
+            ws.start()  # blocks until connection is lost and reconnects exhaust
+            # If start() returns normally (shouldn't happen), loop and reconnect.
+            log.warning("ws.start() returned unexpectedly, reconnecting (attempt %d)", attempt)
+        except KeyboardInterrupt:
+            raise
+        except SystemExit:
+            raise
+        except Exception as e:
+            # ServerUnreachableException or any other failure: back off and retry.
+            log.error("ws connection lost (attempt %d): %s — retrying in 30s", attempt, e)
+            _time.sleep(30)
 
 
 if __name__ == "__main__":
