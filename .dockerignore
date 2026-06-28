@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Build-context whitelist for the feishu-claude-agent image.
+#
+# The Dockerfile (docker/Dockerfile, passed via `dockerfile:` / `-f`) only ever
+# COPYs two files — agent_runner.py and agent_runner_opencode.py. Everything else
+# in the repo is irrelevant to the image, so we EXCLUDE IT ALL by default and
+# allow only those two files through.
+#
+# Why a whitelist (not a blacklist): this guarantees that secrets, logs,
+# sessions.json, bridge.pid, .env, .git, .venv, *.bak, scripts/, and any file
+# accidentally committed in the FUTURE can never reach the Docker daemon or
+# end up in an image layer — even though the Dockerfile itself wouldn't COPY
+# them. Defense in depth.
+#
+# NOTE: `**` matches everything recursively. The Dockerfile is read via its `-f`
+# path and is NOT subject to .dockerignore, so docker/ does not need to be
+# allowed here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Exclude everything by default.
+**
+
+# Allow exactly the two files the Dockerfile COPYs into the image.
+!agent_runner.py
+!agent_runner_opencode.py

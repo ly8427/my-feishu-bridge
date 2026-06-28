@@ -13,8 +13,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI.
-RUN npm install -g @anthropic-ai/claude-code
+# Claude Code CLI. Clean the npm cache in the SAME layer so it never lands in
+# an image layer (cleaning it in a later layer wouldn't shrink the image).
+RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
 
 # OpenCode CLI (from GitHub releases).
 RUN curl -sL -o /tmp/opencode.tar.gz \
