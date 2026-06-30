@@ -1,9 +1,13 @@
 services:
   agent:
+    # Keep `build:` so `cli.py up` (which always passes --build) still builds
+    # locally and tags the result as `image:` below. `docker compose pull`
+    # separately fetches the published registry image. This preserves the
+    # existing local-build workflow while enabling prebuilt-image pulls.
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: feishu-claude-agent:latest
+    image: ghcr.io/ly8427/feishu-claude-agent:latest
     container_name: feishu-claude-agent
     # No published ports: the container is reached only via `docker exec`.
     # No network access needed beyond Anthropic API (default bridge is fine;
