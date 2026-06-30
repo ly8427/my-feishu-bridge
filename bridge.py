@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import queue
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -892,15 +893,113 @@ def _patch_websockets_no_native_ping() -> None:
         _orig_connect = websockets.connect
 
         def _patched_connect(uri, **kwargs):
-            # Only override if caller didn't set these explicitly
+            # Disable native WS ping (Feishu server ignores RFC 6455 pings;
+            # the lark SDK uses its own protobuf ping instead).
             kwargs.setdefault("ping_interval", None)
             kwargs.setdefault("ping_timeout", None)
+            # Hard deadline on the handshake itself (default 10s, but be
+            # explicit so a half-open TCP can't hang forever in recv).
+            kwargs.setdefault("open_timeout", 20)
             return _orig_connect(uri, **kwargs)
 
         websockets.connect = _patched_connect
         log.info("Patched websockets.connect: native WS ping disabled")
     except Exception as e:
         log.warning("Failed to patch websockets (non-fatal): %s", e)
+
+
+def _patch_requests_timeout() -> None:
+    """Force a default timeout on every requests.post.
+
+    The lark SDK's _get_conn_url() does a synchronous requests.post() to fetch
+    the WS URL with NO timeout. If that call stalls (DNS/TCP/half-open), it
+    blocks the single asyncio event-loop thread forever while holding the SDK's
+    connection lock — freezing ping/recv/reconnect so no exception ever fires.
+    That silent unbounded block is the root cause of the multi-hour zombie
+    disconnects. Bounding it to 15s turns the stall into a raised exception that
+    the SDK's normal reconnect path then handles. setdefault() so a caller's own
+    timeout is always respected.
+    """
+    try:
+        import requests
+        _orig_post = requests.post
+
+        def _post_with_timeout(url, *args, **kwargs):
+            kwargs.setdefault("timeout", 15)
+            return _orig_post(url, *args, **kwargs)
+
+        requests.post = _post_with_timeout
+        log.info("Patched requests.post: default timeout=15s")
+    except Exception as e:
+        log.warning("Failed to patch requests (non-fatal): %s", e)
+
+
+# Max seconds the connection may go without receiving ANY WS frame before we
+# assume it's frozen / half-open and force a restart. The lark SDK pings every
+# ~120s and the server responds with a pong, so a healthy idle connection
+# receives a frame at least that often; 600s is a ~5x margin.
+_WATCHDOG_TIMEOUT = 600
+
+# Liveness signal for the connection watchdog. Refreshed by _install_recv_tracker
+# on every inbound WS frame (pong / control / event). Initialized to startup
+# time by the watchdog so it is armed immediately — which also catches the
+# "connected but never delivers a frame" failure mode.
+_last_recv_ts: float = 0.0
+
+
+def _install_recv_tracker(ws) -> None:
+    """Wrap ws._handle_message so every received WS frame refreshes _last_recv_ts.
+
+    The watchdog keys off _last_recv_ts instead of log activity: a healthy idle
+    connection still receives the server's pong/heartbeats (~every 120s) so it is
+    never mis-killed, while a frozen asyncio loop or a half-open connection that
+    stops delivering frames is caught within _WATCHDOG_TIMEOUT. Done per-Client
+    instance; the lark SDK reuses the same instance across its internal reconnects,
+    so one wrap covers the whole process lifetime.
+    """
+    orig = ws._handle_message
+
+    async def _tracked(msg):
+        global _last_recv_ts
+        _last_recv_ts = time.time()
+        return await orig(msg)
+
+    ws._handle_message = _tracked
+
+
+def _start_connection_watchdog() -> None:
+    """Daemon thread that force-restarts the process if the connection is dead.
+
+    Unlike the old log-mtime watchdog, this keys off the WS recv timestamp
+    (_last_recv_ts), refreshed on every inbound frame. That distinguishes a
+    healthy idle connection (the server keeps pushing pong/heartbeats) from a
+    truly dead one — so healthy idle connections are NOT mis-killed. A frozen
+    asyncio loop (now structurally prevented by the requests/open_timeout bounds)
+    or a half-open connection that silently stops delivering frames triggers an
+    os._exit(1); systemd's Restart=on-failure brings us back with a fresh socket.
+    """
+    global _last_recv_ts
+    _last_recv_ts = time.time()  # armed from boot; also catches connected-but-silent
+
+    def _watchdog():
+        time.sleep(30)  # let the initial connect settle before first check
+        while True:
+            try:
+                if _last_recv_ts and time.time() - _last_recv_ts > _WATCHDOG_TIMEOUT:
+                    idle = int(time.time() - _last_recv_ts)
+                    print(
+                        f"\n[WATCHDOG] No WS frame received for {idle}s "
+                        f"(threshold {_WATCHDOG_TIMEOUT}s). "
+                        f"Force-killing for systemd restart.\n",
+                        file=sys.stderr, flush=True,
+                    )
+                    os._exit(1)
+            except Exception:
+                pass
+            time.sleep(30)
+
+    threading.Thread(target=_watchdog, daemon=True, name="conn-watchdog").start()
+    log.info("Connection watchdog started (recv-based, timeout=%ds)", _WATCHDOG_TIMEOUT)
 
 
 def main() -> None:
@@ -921,8 +1020,16 @@ def main() -> None:
     # recurring 'keepalive ping timeout' disconnects (Feishu server ignores
     # RFC 6455 pings; the lark SDK uses its own protobuf ping instead).
     _patch_websockets_no_native_ping()
+    _patch_requests_timeout()
 
     log.info("Bridge up. Whitelisted user: %s | container: %s", ALLOWED_USER_ID, CONTAINER_NAME)
+
+    # Start a recv-based watchdog daemon thread. If the connection goes
+    # _WATCHDOG_TIMEOUT seconds without receiving ANY WS frame, the asyncio
+    # loop is frozen or the connection is half-open — force-kill the process so
+    # systemd restarts it with a clean connection. Healthy idle connections are
+    # not mis-killed: the server keeps pushing pong/heartbeats (~every 120s).
+    _start_connection_watchdog()
 
     # The lark SDK's reconnect loop is bounded by a server-controlled
     # ReconnectCount. When retries are exhausted it raises
@@ -937,6 +1044,9 @@ def main() -> None:
                 APP_ID, APP_SECRET,
                 event_handler=handler, log_level=lark.LogLevel.INFO,
             )
+            # Record every inbound frame for the recv-based watchdog. Done per
+            # instance; the SDK reuses this same `ws` across internal reconnects.
+            _install_recv_tracker(ws)
             ws.start()  # blocks until connection is lost and reconnects exhaust
             # If start() returns normally (shouldn't happen), loop and reconnect.
             log.warning("ws.start() returned unexpectedly, reconnecting (attempt %d)", attempt)
