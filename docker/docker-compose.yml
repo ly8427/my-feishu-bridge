@@ -12,24 +12,31 @@ services:
     # No published ports: the container is reached only via `docker exec`.
     # No network access needed beyond Anthropic API (default bridge is fine;
     # tighten with `network_mode` if you want to lock egress further).
+    # Secrets are NOT baked into the container env (S5): baked vars sit in PID1's
+    # /proc/1/environ for the whole container lifetime, readable by the agent via
+    # an auto-approved Read. bridge.py injects per-turn, per-provider auth through
+    # `docker exec -e` instead. Only non-secret operational defaults live here.
     environment:
-      # This machine uses a relay (base URL + auth token). Forward all three;
-      # unset ones simply resolve to empty. Set in your shell or via --env-file.
-      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
-      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      # OpenCode provider credentials (backward compat: also reads ZHIPU_API_KEY)
-      OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
-      OPENCODE_API_URL: ${OPENCODE_API_URL:-}
+      OPENCODE_API_URL: ${OPENCODE_API_URL:-https://open.bigmodel.cn/api/coding/paas/v4}
       OPENCODE_MODEL: ${OPENCODE_MODEL:-zhipuai-coding-plan/glm-5.2}
-      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+    # S3 hardening: drop root + all Linux capabilities, block privilege
+    # escalation, and cap pids/memory so a runaway agent can't exhaust the host.
+    # uid 1000 matches the typical host workspace owner so the bind mount stays
+    # writable (the agent user is created with uid 1000 in the Dockerfile).
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 4g
     volumes:
       # The ONLY host path the agent can see. Read-write inside this dir only.
+      # ⚠️ Do NOT point WORKSPACE_DIR at a directory that contains this bridge's
+      # own source — the agent could then rewrite host-executed code (see S2).
       - ${WORKSPACE_DIR}:${WORKSPACE_DIR}
       # OpenCode provider credentials (auth.json from opencode auth login).
-      # Mount host's credentials read-only so container rebuilds don't lose auth.
-      # Path is configurable; defaults to ~/.local/share/opencode/auth.json.
-      - ${OPENCODE_AUTH_FILE:-~/.local/share/opencode/auth.json}:/root/.local/share/opencode/auth.json:ro
+      # Mounted read-only under the non-root agent's HOME so the opencode engine
+      # can read it. Path is configurable; defaults to ~/.local/share/opencode.
+      - ${OPENCODE_AUTH_FILE:-~/.local/share/opencode/auth.json}:/home/agent/.local/share/opencode/auth.json:ro
     working_dir: ${WORKSPACE_DIR}
     restart: unless-stopped
     command: ["sleep", "infinity"]

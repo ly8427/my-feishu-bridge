@@ -118,9 +118,16 @@ OPENCODE_MODEL=your-provider/your-model
 ```bash
 cd /path/to/feishu-bridge
 
-# 0) 宿主机 venv（仅需 lark-oapi）
+# 0) 宿主机 venv（仅需 lark-oapi，见 requirements.txt）
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt        # Windows: .venv\Scripts\pip install ...
+source .venv/bin/activate                        # Windows: .venv\Scripts\activate
+
+# ⚠️ cli.py / bridge.py 必须用上面这个装了 lark-oapi 的解释器运行：
+#    · 已 activate  → 直接 `python3 cli.py …`
+#    · 没 activate  → 用 `.venv/bin/python3 cli.py …`
+#    （cli.py 会自动检测：当前 python 没有 lark-oapi 时回退到 .venv，
+#     仍找不到就报清晰错误，而不是启一个一启动就崩的 bridge。）
 
 # 1) 凭证（见上一节）
 

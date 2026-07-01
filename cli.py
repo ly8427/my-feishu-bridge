@@ -96,9 +96,75 @@ def _is_windows() -> bool:
     return sys.platform == "win32"
 
 
+def _venv_python() -> str | None:
+    """Path to the project venv interpreter, if it exists.
+
+    The host's ONLY Python dependency is lark-oapi, installed into this venv
+    (see requirements.txt / README deploy steps). Used to auto-resolve a working
+    interpreter when cli.py is launched from the system Python that lacks it.
+    """
+    bin_dir = "Scripts" if _is_windows() else "bin"
+    exe = "python.exe" if _is_windows() else "python3"
+    p = HERE / ".venv" / bin_dir / exe
+    return str(p) if p.exists() else None
+
+
+def _has_lark_oapi(interpreter: str | None = None) -> bool:
+    """True if `interpreter` can import lark-oapi.
+
+    For the CURRENT interpreter (interpreter is None) we probe in-process via
+    importlib — fast, no subprocess. For any EXPLICIT interpreter path (e.g. the
+    venv) we spawn it once and let IT decide: a venv python is a symlink to the
+    base binary, so comparing paths (even realpath) would wrongly collapse to
+    the running interpreter. Only a real subprocess under that path picks up the
+    venv's own site-packages. bridge.py does `import lark_oapi` at startup, so
+    this is its one hard host requirement.
+    """
+    if interpreter is None:
+        import importlib.util
+        try:
+            return importlib.util.find_spec("lark_oapi") is not None
+        except (ModuleNotFoundError, ValueError):
+            return False
+    return _run([interpreter, "-c", "import lark_oapi"]).returncode == 0
+
+
+def _exit_missing_lark(venv_hint: str | None) -> None:
+    """Print an actionable 'install lark-oapi' message, then exit(1).
+
+    Reached only when neither the current interpreter nor the project venv can
+    import lark-oapi — i.e. a fresh clone with no venv yet, or a broken one.
+    Better to stop here with a fix than spawn a bridge that dies on import.
+    """
+    _fail("bridge.py needs lark-oapi, which isn't importable by this Python")
+    _info(f"checked interpreter: {sys.executable}")
+    if venv_hint:
+        _info(f"also tried venv: {venv_hint} — lark-oapi missing there too")
+    _info("FIX → create the host venv and install its one dependency:")
+    _info("        python3 -m venv .venv")
+    _info("        .venv/bin/pip install -r requirements.txt")
+    _info("    then either `source .venv/bin/activate`, or run cli.py via:")
+    _info(f"        {venv_hint or '.venv/bin/python3'} cli.py start --detach")
+    sys.exit(1)
+
+
 def _python() -> str:
-    """Python interpreter to launch bridge.py with (this process's exe)."""
-    return sys.executable or "python3"
+    """Interpreter to launch bridge.py with — guaranteed to have lark-oapi.
+
+    bridge.py imports lark-oapi (the host's only dependency), which normally
+    lives in the project venv. If THIS process can already import it (venv was
+    activated, or cli.py launched via .venv/bin/python3), use sys.executable.
+    Otherwise auto-detect the sibling .venv so a bare `python3 cli.py start`
+    from the system interpreter still works. If neither has lark-oapi, fail
+    loudly with a fix hint instead of spawning a bridge that crashes on import.
+    """
+    if _has_lark_oapi(None):
+        return sys.executable or "python3"
+    venv = _venv_python()
+    if venv and _has_lark_oapi(venv):
+        return venv
+    _exit_missing_lark(venv)
+    return ""  # unreachable — _exit_missing_lark raises SystemExit
 
 
 # ----------------------------------------------------- check building blocks
@@ -106,6 +172,21 @@ def _check_python() -> tuple[bool, str]:
     ver = sys.version_info
     ok = ver >= (3, 10)
     return ok, f"Python {ver.major}.{ver.minor}.{ver.micro} ({sys.executable})"
+
+
+def _check_host_runtime() -> tuple[bool, str]:
+    """bridge.py imports lark-oapi — the host's only Python dependency.
+
+    Confirm some resolvable interpreter has it: the current one, else the
+    project venv (which _python() auto-uses). This is what makes `cli.py start`
+    work even when launched from the system python.
+    """
+    if _has_lark_oapi(None):
+        return True, "lark-oapi OK (current interpreter)"
+    venv = _venv_python()
+    if venv and _has_lark_oapi(venv):
+        return True, f"lark-oapi OK in .venv (cli.py auto-uses {venv})"
+    return False, "lark-oapi not importable — install it into .venv (requirements.txt)"
 
 
 def _check_docker() -> tuple[bool, str]:
@@ -279,6 +360,7 @@ def _check_opencode_auth() -> tuple[bool, str]:
 def _all_checks() -> list[tuple[str, tuple[bool, str]]]:
     return [
         ("Python >= 3.10", _check_python()),
+        ("Host runtime (lark-oapi)", _check_host_runtime()),
         ("Docker daemon", _check_docker()),
         ("Docker compose", _check_compose()),
         ("Credentials (.env)", _check_credentials()),
@@ -325,6 +407,8 @@ def _fix_hint(name: str, detail: str) -> None:
     hints = {
         "Python >= 3.10": "Install Python 3.10+ — https://www.python.org/downloads/  "
                           "(Linux: sudo apt install python3 python3-venv)",
+        "Host runtime (lark-oapi)": "Create the host venv and install its one dependency:  "
+                          "python3 -m venv .venv  &&  .venv/bin/pip install -r requirements.txt",
         "Docker daemon": "Install Docker Desktop (Win/Mac) or docker engine (Linux). "
                          "Start Docker Desktop, or: sudo systemctl start docker",
         "Docker compose": "Docker Desktop bundles compose v2. On Linux: "
@@ -394,6 +478,13 @@ def _spawn_bridge(detach: bool) -> int:
     env = dict(os.environ)
     # The bridge loads its own env file via FEISHU_ENV_FILE; make sure it's set.
     env.setdefault("FEISHU_ENV_FILE", str(_env_file()))
+    # Resolve an interpreter that can actually run bridge.py (it imports
+    # lark-oapi). _python() auto-uses the project venv when the current shell's
+    # python lacks it; surface the substitution so `start`/`restart` aren't a
+    # black box (and so the user knows which python is running the bridge).
+    py = _python()
+    if py and py != sys.executable:
+        _info(f"using venv python for bridge.py: {py}")
     if detach:
         # Detached, logs to bridge.log. Cross-platform: no nohup/disown.
         flags = (
@@ -402,7 +493,7 @@ def _spawn_bridge(detach: bool) -> int:
         log_fh = open(BRIDGE_LOG, "ab")
         try:
             proc = subprocess.Popen(
-                [_python(), str(BRIDGE_PY)],
+                [py, str(BRIDGE_PY)],
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -425,7 +516,7 @@ def _spawn_bridge(detach: bool) -> int:
     else:
         # Foreground: inherit tty, Ctrl-C / SIGTERM propagate naturally.
         print(f"Starting bridge in foreground (Ctrl-C to stop). Log also → {BRIDGE_LOG}")
-        return subprocess.call([_python(), str(BRIDGE_PY)], env=env)
+        return subprocess.call([py, str(BRIDGE_PY)], env=env)
 
 
 def cmd_start(args) -> int:

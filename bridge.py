@@ -68,6 +68,9 @@ WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR") or os.path.join(
 CONFIRM_TIMEOUT = os.environ.get("CONFIRM_TIMEOUT", "300")
 SAFE_TOOLS = os.environ.get("SAFE_TOOLS", "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookRead")
 DEFAULT_ENGINE = os.environ.get("ENGINE", "claude")
+# S7: cap the prompt length so a single huge message can't blow the docker exec
+# argv or burn API tokens. Feishu single-message max is ~4k, so 8k is generous.
+MAX_PROMPT_LEN = int(os.environ.get("MAX_PROMPT_LEN", "8000"))
 
 
 # ---------------------------------------------------------------- provider table
@@ -127,6 +130,29 @@ def _apply_provider(name: str, chat_id: str = "") -> None:
         os.environ["ANTHROPIC_MODEL"] = prov["models"][0]
 
 
+def _provider_env(provider: str, chat_id: str = "") -> dict[str, str]:
+    """This turn's Anthropic auth/model vars from the provider table, computed
+    WITHOUT touching global os.environ.
+
+    S4: concurrent turns for different providers used to race on os.environ —
+    thread A could overwrite ANTHROPIC_BASE_URL between thread B's write and its
+    read, pairing B's api_key with A's base_url (key POSTed to the wrong
+    vendor). Returning a local dict per turn removes the shared mutable state.
+    Mirrors the model selection in _apply_provider.
+    """
+    prov = _PROVIDERS.get(provider, {})
+    env: dict[str, str] = {}
+    if prov.get("base_url"):
+        env["ANTHROPIC_BASE_URL"] = prov["base_url"]
+    if prov.get("api_key"):
+        env["ANTHROPIC_AUTH_TOKEN"] = prov["api_key"]
+        env["ANTHROPIC_API_KEY"] = prov["api_key"]
+    model = _chat_model.get(chat_id) or (prov.get("models") or [""])[0]
+    if model:
+        env["ANTHROPIC_MODEL"] = model
+    return env
+
+
 # per-chat state: engine, provider, model overrides (in-memory, process lifetime)
 _chat_engine: dict[str, str] = {}
 _chat_provider: dict[str, str] = {}
@@ -173,10 +199,20 @@ _CLAUDE_FORWARD_VARS = (
 # per-chat engine preference (chat_id -> "claude" | "opencode")
 _chat_engine: dict[str, str] = {}
 
+from logging.handlers import RotatingFileHandler
+
+_LOG_PATH = os.path.join(os.path.dirname(__file__), "bridge.log")
+# Rotating file handler (T4): bridge.log lives in the mounted workspace and the
+# bridge runs indefinitely; cap it at 10MB × 3 backups so it can't fill the disk.
+# The _RedactFilter is attached to every handler below, so rotated files are
+# scrubbed too.
+_file_handler = RotatingFileHandler(
+    _LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(), logging.StreamHandler(open(os.path.join(os.path.dirname(__file__), "bridge.log"), "a", buffering=1))],
+    handlers=[logging.StreamHandler(), _file_handler],
 )
 log = logging.getLogger("bridge")
 
@@ -206,7 +242,7 @@ class _RedactFilter(logging.Filter):
         r"access_key=[A-Za-z0-9]+"          # feishu WS connection credential
         r"|ticket=[A-Za-z0-9-]+"            # feishu WS connection ticket
         r"|app_secret=[A-Za-z0-9]+"         # feishu app secret if ever logged
-        r"|(?:FEISHU_APP_SECRET|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY)=[A-Za-z0-9_\-]+"
+        r"|(?:FEISHU_APP_SECRET|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENCODE_API_KEY|ZHIPU_API_KEY|DEEPSEEK_API_KEY)=[A-Za-z0-9_\-]+"
         r"|sk-[A-Za-z0-9]{6,}"              # any Anthropic/relay bearer token
         r")"
     )
@@ -263,6 +299,18 @@ _card_workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="card")
 # confirm_id -> callable(allow: bool) that pushes the reply into the agent stdin
 _confirm_waiters: dict[str, "Job"] = {}
 _confirm_lock = threading.Lock()
+
+# T1: chats with an in-flight turn. Prevents two concurrent `docker exec` agents
+# from --resume-ing the same session_id (which corrupts its transcript). Guarded
+# by _active_lock; the slot is released in _render_loop's finally.
+_active_chats: set[str] = set()
+_active_lock = threading.Lock()
+
+
+def _release_chat(chat_id: str) -> None:
+    """Release a chat's in-flight-turn slot (see T1)."""
+    with _active_lock:
+        _active_chats.discard(chat_id)
 
 
 # ---------------------------------------------------------------- Feishu helpers
@@ -373,7 +421,22 @@ def _drain_job(job: Job) -> None:
 
 
 def _render_loop(job: Job) -> None:
-    """Render thread: consume the agent's JSON lines and reflect them onto Feishu.
+    """Render thread wrapper: run the render body, then ALWAYS release the
+    per-chat turn slot (T1) and drop any dangling confirm waiters for this job
+    (T3) — even if the body raises — so a chat can never get stuck 'busy' and
+    timed-out confirmations don't leak Job references.
+    """
+    try:
+        _render_loop_body(job)
+    finally:
+        _release_chat(job.chat_id)
+        with _confirm_lock:
+            for _cid in [k for k, v in _confirm_waiters.items() if v is job]:
+                _confirm_waiters.pop(_cid, None)
+
+
+def _render_loop_body(job: Job) -> None:
+    """Consume the agent's JSON lines and reflect them onto Feishu.
 
     Runs independently of _drain_job, so a slow lark HTTP call only delays this
     card update — it never blocks the agent's stdout from being read.
@@ -438,9 +501,22 @@ def _safe_start_turn(chat_id: str, text: str) -> None:
         _start_turn(chat_id, text)
     except Exception:
         log.exception("CRASH in _start_turn")
+        # The T1 slot is acquired inside _start_turn before any failure point;
+        # the render thread that normally releases it never started, so release
+        # here to avoid wedging the chat in a permanent 'busy' state.
+        _release_chat(chat_id)
 
 
 def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
+    # T1: one in-flight turn per chat. Two concurrent turns would launch two
+    # `docker exec` agents that --resume the SAME session_id and corrupt its
+    # transcript. If a turn is already running, tell the user and bail; the slot
+    # is released in _render_loop's finally (or by _safe_start_turn on crash).
+    with _active_lock:
+        if chat_id in _active_chats:
+            _post_card(chat_id, "⏳ 上一条指令还在处理中，请等它完成后再发一条。")
+            return
+        _active_chats.add(chat_id)
     engine = engine or _chat_engine.get(chat_id, DEFAULT_ENGINE)
     resume = session_store.get(f"{engine}:{chat_id}")
     # OpenCode sessions are ephemeral — each runner starts a fresh server,
@@ -458,13 +534,23 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     # Apply per-chat provider and model overrides BEFORE building the docker exec
     # command, so the -e flags pick up the right BASE_URL/API_KEY/MODEL.
     provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
-    _apply_provider(provider, chat_id)
-    if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-        os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+    # S4: resolve this turn's provider auth/model into a LOCAL dict (no global
+    # os.environ mutation) so concurrent turns can't cross-pair one provider's
+    # api_key with another's base_url. Provider override wins; else fall back to
+    # the host's static env. Then mirror AUTH_TOKEN→API_KEY (claude CLI reads
+    # only API_KEY).
+    _prov_env = _provider_env(provider, chat_id)
+    _fwd: dict[str, str] = {}
+    for var in _CLAUDE_FORWARD_VARS:
+        val = _prov_env.get(var) or os.environ.get(var)
+        if val:
+            _fwd[var] = val
+    if not _fwd.get("ANTHROPIC_API_KEY") and _fwd.get("ANTHROPIC_AUTH_TOKEN"):
+        _fwd["ANTHROPIC_API_KEY"] = _fwd["ANTHROPIC_AUTH_TOKEN"]
     cmd = ["docker", "exec", "-i"]
     for var in _CLAUDE_FORWARD_VARS:
-        if os.environ.get(var):
-            cmd += ["-e", f"{var}={os.environ[var]}"]
+        if _fwd.get(var):
+            cmd += ["-e", f"{var}={_fwd[var]}"]
     if engine == "opencode":
         for var in ("OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY"):
             if os.environ.get(var):
@@ -499,11 +585,15 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
         _passthrough_vars = _passthrough_vars + (
             "OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY",
         )
-    _clean_env = {
-        k: os.environ[k]
-        for k in _passthrough_vars
-        if k in os.environ
-    }
+    # Use the per-turn resolved values (_fwd) for the Anthropic vars and host
+    # env for the rest — again avoiding global os.environ as per-turn scratch (S4).
+    _clean_env = {}
+    for k in _passthrough_vars:
+        if k in _CLAUDE_FORWARD_VARS:
+            if _fwd.get(k):
+                _clean_env[k] = _fwd[k]
+        elif k in os.environ:
+            _clean_env[k] = os.environ[k]
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -745,6 +835,13 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         else:
             arg = parts[1].strip()
             _card_workers.submit(_handle_resume_cmd, chat_id, arg)
+        return
+
+    if len(text) > MAX_PROMPT_LEN:
+        _card_workers.submit(
+            _post_card, chat_id,
+            f"指令过长（{len(text)} 字符），上限 {MAX_PROMPT_LEN}。请拆分或精简后再发。"
+        )
         return
 
     log.info("turn from %s in %s: %s", sender_id, chat_id, text[:80])
@@ -1021,8 +1118,38 @@ def _start_connection_watchdog() -> None:
     log.info("Connection watchdog started (recv-based, timeout=%ds)", _WATCHDOG_TIMEOUT)
 
 
+def _warn_if_source_in_workspace() -> None:
+    """S2: the bridge's own source must not sit inside the agent-writable mount.
+
+    WORKSPACE_DIR is bind-mounted RW into the container and the agent runs as
+    root there. If bridge.py/cli.py live under WORKSPACE_DIR, a single approved
+    Write/Edit lets the containerized agent rewrite the very code the HOST later
+    executes (container→host code injection). We can't repair the mount from
+    here, but we refuse to be silent: warn loudly, and hard-refuse to start when
+    WORKSPACE_STRICT is set.
+    """
+    src = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    ws = os.path.realpath(WORKSPACE_DIR)
+    try:
+        inside = os.path.commonpath([ws, src]) == ws
+    except ValueError:
+        inside = False
+    if not inside:
+        return
+    msg = (
+        f"bridge source ({src}) is INSIDE WORKSPACE_DIR ({ws}), which is mounted "
+        f"RW into the agent container — the agent could rewrite bridge code that "
+        f"the host then runs. Point WORKSPACE_DIR at a dedicated subdirectory "
+        f"that excludes the bridge source."
+    )
+    if os.environ.get("WORKSPACE_STRICT"):
+        sys.exit(f"[REFUSING TO START — S2] {msg}  (unset WORKSPACE_STRICT to override.)")
+    log.warning("⚠️  SECURITY (S2): %s", msg)
+
+
 def main() -> None:
     _ensure_single_instance()
+    _warn_if_source_in_workspace()
     # SIGINT (Ctrl-C) works everywhere; SIGTERM lets systemd `stop` and
     # `docker stop`-style supervisors shut us down cleanly. Neither uses the
     # old SIGKILL path, so this is Windows-compatible.
