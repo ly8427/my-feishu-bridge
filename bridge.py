@@ -135,6 +135,24 @@ _chat_model: dict[str, str] = {}
 # Apply default provider at startup so the first turn uses correct credentials.
 _apply_provider(_DEFAULT_PROVIDER)
 
+
+def _effective_model(chat_id: str, provider: str) -> str:
+    """Resolve the model that WILL actually be used on the next turn for this
+    chat: an explicit `/model` override wins, else the current provider's
+    default (first) model. Mirrors the selection in _apply_provider.
+
+    Do NOT read os.environ["ANTHROPIC_MODEL"] for display — that var is only
+    refreshed by _apply_provider at turn-start, so right after `/provider` it
+    still holds the *previous* provider's model (e.g. shows deepseek-v4-pro
+    even after switching to zhipu)."""
+    override = _chat_model.get(chat_id)
+    if override:
+        return override
+    prov = _PROVIDERS.get(provider, {})
+    if prov.get("models"):
+        return prov["models"][0]
+    return os.environ.get("ANTHROPIC_MODEL", "?")
+
 # Anthropic/Claude-Code env vars forwarded into the agent container when the
 # claude engine runs. Auth (BASE_URL/AUTH_TOKEN/API_KEY) is always relevant;
 # the MODEL* and CLAUDE_CODE* vars let a relay-compatible endpoint pin which
@@ -503,7 +521,7 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     # the agent's stdout (the root cause of multi-minute stalls).
     threading.Thread(target=_drain_job, args=(job,), daemon=True).start()
     _prov = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
-    _mdl = _chat_model.get(chat_id) or os.environ.get("ANTHROPIC_MODEL", "?")
+    _mdl = _effective_model(chat_id, _prov)
     log.info("turn started: engine=%s provider=%s model=%s", engine, _prov, _mdl)
     threading.Thread(target=_render_loop, args=(job,), daemon=True).start()
 
@@ -685,9 +703,10 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 _chat_model.pop(chat_id, None)
                 prov = _PROVIDERS[name]
                 models = ", ".join(prov["models"]) or "(未配置)"
+                cur_mdl = _effective_model(chat_id, name)
                 _card_workers.submit(
                     _post_card, chat_id,
-                    f"🏢 厂商已切换: `{name}`\n模型: {models}\n会话已清除。\n用 `/model` 查看可选模型。"
+                    f"🏢 厂商已切换: `{name}`\n当前模型: `{cur_mdl}`\n可选: {models}\n会话已清除。\n用 `/model` 切换其他模型。"
                 )
             else:
                 available = ", ".join(_PROVIDERS.keys())
@@ -698,7 +717,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         parts = text.split(None, 1)
         provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
         prov = _PROVIDERS.get(provider, {})
-        cur_model = _chat_model.get(chat_id) or os.environ.get("ANTHROPIC_MODEL", "?")
+        cur_model = _effective_model(chat_id, provider)
         if len(parts) < 2:
             # Show current model + available list for current provider
             lines = [f"🤖 **模型管理**", f"厂商: `{provider}`", f"当前: `{cur_model}`", "", "**可用模型:**"]
