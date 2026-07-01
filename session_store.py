@@ -42,5 +42,9 @@ def clear(chat_id: str) -> None:
         data = _load()
         if chat_id in data:
             del data[chat_id]
-            with open(_PATH, "w", encoding="utf-8") as f:
+            # Atomic write (tmp + os.replace), matching put(): a crash mid-write
+            # must never truncate sessions.json to a partial/empty file.
+            tmp = _PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _PATH)

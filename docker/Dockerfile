@@ -34,5 +34,15 @@ WORKDIR /app
 COPY agent_runner.py /app/agent_runner.py
 COPY agent_runner_opencode.py /app/agent_runner_opencode.py
 
+# Non-root user (S3). uid/gid 1000 matches the typical host workspace owner so
+# the bind-mounted WORKSPACE_DIR stays writable while the agent drops root. HOME
+# is created + owned by the user so claude/opencode can write their config, and
+# the opencode auth.json bind-mount lands under this HOME (see docker-compose).
+RUN groupadd -g 1000 agent \
+    && useradd -u 1000 -g 1000 -m -d /home/agent -s /bin/bash agent \
+    && mkdir -p /home/agent/.config/opencode /home/agent/.local/share/opencode \
+    && chown -R agent:agent /home/agent
+USER agent
+
 # Keep the container alive so the host can `docker exec` turns into it.
 CMD ["sleep", "infinity"]

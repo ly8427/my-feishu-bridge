@@ -48,11 +48,57 @@ from claude_agent_sdk import (
 SAFE_TOOLS = {
     t.strip()
     for t in os.environ.get(
-        "SAFE_TOOLS", "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookRead"
+        # WebSearch/WebFetch intentionally NOT auto-allowed (S3): they are egress
+        # channels that could exfiltrate a leaked secret without a tap.
+        "SAFE_TOOLS", "Read,Grep,Glob,TodoWrite,NotebookRead"
     ).split(",")
     if t.strip()
 }
 CONFIRM_TIMEOUT = float(os.environ.get("CONFIRM_TIMEOUT", "300"))
+
+# Working directory the agent is scoped to. Read-family tools are auto-approved
+# ONLY for paths inside this tree; anything outside (/proc, /root, the mounted
+# opencode auth.json, host secrets) falls through to an explicit Feishu confirm
+# even though the tool is nominally "safe". This closes the zero-confirmation
+# credential read (S1): SAFE_TOOLS ∋ Read is no longer a blank cheque to read
+# /proc/self/environ or /root/.local/share/opencode/auth.json.
+WORKSPACE_DIR = os.path.realpath(os.environ.get("WORKSPACE_DIR", os.getcwd()))
+
+# Read-family tools that take a path and can reveal file content or layout.
+_PATH_SCOPED_READERS = {"Read", "NotebookRead", "Grep", "Glob"}
+
+
+def _path_arg(tool_name: str, tool_input: dict) -> str | None:
+    """Extract the filesystem path a read-family tool will touch, if any.
+
+    Grep/Glob without an explicit path default to the cwd (WORKSPACE_DIR), which
+    is in-scope, so None → treated as safe.
+    """
+    if tool_name == "Read":
+        return tool_input.get("file_path")
+    if tool_name == "NotebookRead":
+        return tool_input.get("notebook_path")
+    if tool_name in ("Grep", "Glob"):
+        return tool_input.get("path")
+    return None
+
+
+def _within_workspace(path: str | None) -> bool:
+    """True if `path` resolves to somewhere inside WORKSPACE_DIR.
+
+    realpath() resolves symlinks and '..', so a symlink inside the workspace
+    that points at /root or /proc is correctly judged out-of-scope. A missing
+    path (Grep/Glob defaulting to cwd) is in-scope.
+    """
+    if not path:
+        return True
+    target = path if os.path.isabs(path) else os.path.join(WORKSPACE_DIR, path)
+    target = os.path.realpath(target)
+    try:
+        return os.path.commonpath([WORKSPACE_DIR, target]) == WORKSPACE_DIR
+    except ValueError:
+        # e.g. different drive on Windows — treat as out-of-scope.
+        return False
 
 _stdout_lock = asyncio.Lock()
 # Pending confirmations: id -> Future[bool]
@@ -138,16 +184,32 @@ def _brief_for(tool_name: str, tool_input: dict) -> str:
             parts.append(f"…(还有 {len(edits) - 5} 处未显示)")
         return "\n".join(parts)
 
+    if tool_name in _PATH_SCOPED_READERS:
+        p = _path_arg(tool_name, tool_input)
+        flag = "" if _within_workspace(p) else "  ⚠️ 工作区外读取"
+        shown = p or "(工作区)"
+        if tool_name == "Grep":
+            shown = f"{shown}  pattern: {_truncate(tool_input.get('pattern', ''), 200)}"
+        return f"{tool_name} → {shown}{flag}"
+
     return f"{tool_name} {_truncate(json.dumps(tool_input, ensure_ascii=False), 600)}"
 
 
 async def can_use_tool(tool_name: str, tool_input: dict, context) -> object:
     """
-    Permission gate. Read-only tools in SAFE_TOOLS run automatically.
-    Everything else asks the host (Feishu) and blocks until a reply or timeout.
+    Permission gate. Read-only tools in SAFE_TOOLS run automatically, EXCEPT
+    read-family tools whose path escapes WORKSPACE_DIR — those need an explicit
+    Feishu confirm so an agent can't silently read host secrets (/proc, /root,
+    the mounted auth.json). Everything else asks the host and blocks until a
+    reply or timeout.
     """
     if tool_name in SAFE_TOOLS:
-        return PermissionResultAllow()
+        if tool_name in _PATH_SCOPED_READERS and not _within_workspace(
+            _path_arg(tool_name, tool_input)
+        ):
+            pass  # out-of-workspace read → fall through to confirmation below
+        else:
+            return PermissionResultAllow()
 
     cid = "c_" + uuid.uuid4().hex[:8]
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -179,6 +241,16 @@ async def run(prompt: str, resume: str | None) -> int:
         cwd=os.environ.get("WORKSPACE_DIR", os.getcwd()),
         can_use_tool=can_use_tool,
         permission_mode="default",
+        # S8: load ONLY user-level settings (the container's own ~/.claude,
+        # which is fresh/empty). The SDK default is ["user","project"], which
+        # would pull in <WORKSPACE_DIR>/.claude/settings*.json — and since
+        # WORKSPACE_DIR is bind-mounted from the host, that file is the HOST's
+        # Claude Code config (e.g. 81 permissions.allow entries, including
+        # 'Bash(docker rm *)', 'Bash(rm -rf ...)', 'Bash(curl ...)'). Those
+        # project/local rules could auto-allow matching tool calls and bypass
+        # our can_use_tool gate. Excluding "project"/"local" makes this
+        # deterministic regardless of workspace trust state.
+        setting_sources=["user"],
         resume=resume,
         # Model selection. The Claude Agent SDK does NOT read ANTHROPIC_MODEL
         # from the environment — model is ignored unless passed here explicitly.
@@ -272,7 +344,21 @@ async def run(prompt: str, resume: str | None) -> int:
         )
         return 0
     except Exception as exc:  # surface any failure to the host as a clean line
-        await emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        # The SDK's ProcessError wraps a `claude` CLI exit and reports
+        # "Check stderr output for details" — which the host never sees. Pull
+        # every detail off the exception (stderr/stdout/returncode when present)
+        # and its cause chain, so a failure is actually diagnosable instead of
+        # a dead end. This is how we'll learn the real trigger of intermittent
+        # exit-1s (upstream 5xx, auth, resume errors, …) without re-running.
+        parts = [f"{type(exc).__name__}: {exc}"]
+        for _attr in ("stderr", "stdout", "message", "process_error", "returncode", "command"):
+            _v = getattr(exc, _attr, None)
+            if _v:
+                parts.append(f"{_attr}: {str(_v)[:1200]}")
+        _cause = exc.__cause__ or exc.__context__
+        if _cause is not None and _cause is not exc:
+            parts.append(f"caused_by: {type(_cause).__name__}: {_cause}")
+        await emit({"type": "error", "message": "\n".join(parts)})
         return 1
     finally:
         stdin_task.cancel()

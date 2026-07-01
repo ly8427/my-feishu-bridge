@@ -30,5 +30,8 @@ start_bridge_safe.sh
 # AI agent instructions (auto-generated, not for commit)
 CLAUDE.md
 
+# Security audit report v2 — LOCAL ONLY, never commit
+SECURITY_AUDIT_REPORT_v2.md
+
 # Investigation / debug scripts (not production code)
 scripts/
