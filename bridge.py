@@ -157,6 +157,9 @@ def _provider_env(provider: str, chat_id: str = "") -> dict[str, str]:
 _chat_engine: dict[str, str] = {}
 _chat_provider: dict[str, str] = {}
 _chat_model: dict[str, str] = {}
+# pi-only per-chat options (v2): thinking level + tool policy
+_chat_thinking: dict[str, str] = {}   # chat_id -> off/minimal/low/medium/high/xhigh/max
+_chat_tools: dict[str, str] = {}      # chat_id -> "safe" | "full"
 
 # Apply default provider at startup so the first turn uses correct credentials.
 _apply_provider(_DEFAULT_PROVIDER)
@@ -243,6 +246,7 @@ class _RedactFilter(logging.Filter):
         r"|ticket=[A-Za-z0-9-]+"            # feishu WS connection ticket
         r"|app_secret=[A-Za-z0-9]+"         # feishu app secret if ever logged
         r"|(?:FEISHU_APP_SECRET|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENCODE_API_KEY|ZHIPU_API_KEY|DEEPSEEK_API_KEY)=[A-Za-z0-9_\-]+"
+        r"|[A-Z][A-Z0-9_]*_API_KEY=[A-Za-z0-9_\-]+"  # R2-5: generic API_KEY redaction (catches DEFAULT_API_KEY etc.)
         r"|sk-[A-Za-z0-9]{6,}"              # any Anthropic/relay bearer token
         r")"
     )
@@ -534,66 +538,104 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
     # Apply per-chat provider and model overrides BEFORE building the docker exec
     # command, so the -e flags pick up the right BASE_URL/API_KEY/MODEL.
     provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
-    # S4: resolve this turn's provider auth/model into a LOCAL dict (no global
-    # os.environ mutation) so concurrent turns can't cross-pair one provider's
-    # api_key with another's base_url. Provider override wins; else fall back to
-    # the host's static env. Then mirror AUTH_TOKEN→API_KEY (claude CLI reads
-    # only API_KEY).
-    _prov_env = _provider_env(provider, chat_id)
-    _fwd: dict[str, str] = {}
-    for var in _CLAUDE_FORWARD_VARS:
-        val = _prov_env.get(var) or os.environ.get(var)
-        if val:
-            _fwd[var] = val
-    if not _fwd.get("ANTHROPIC_API_KEY") and _fwd.get("ANTHROPIC_AUTH_TOKEN"):
-        _fwd["ANTHROPIC_API_KEY"] = _fwd["ANTHROPIC_AUTH_TOKEN"]
-    cmd = ["docker", "exec", "-i"]
-    for var in _CLAUDE_FORWARD_VARS:
-        if _fwd.get(var):
-            cmd += ["-e", f"{var}={_fwd[var]}"]
-    if engine == "opencode":
-        for var in ("OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY"):
-            if os.environ.get(var):
-                cmd += ["-e", f"{var}={os.environ[var]}"]
-        # Also set ZHIPU_API_KEY from OPENCODE_API_KEY so built-in provider auto-detects
-        if os.environ.get("OPENCODE_API_KEY") and not os.environ.get("ZHIPU_API_KEY"):
-            cmd += ["-e", f"ZHIPU_API_KEY={os.environ['OPENCODE_API_KEY']}"]
-        if os.environ.get("OPENCODE_BIN"):
-            cmd += ["-e", f"OPENCODE_BIN={os.environ['OPENCODE_BIN']}"]
-    cmd += [
-        "-e", f"SAFE_TOOLS={SAFE_TOOLS}",
-        "-e", f"CONFIRM_TIMEOUT={CONFIRM_TIMEOUT}",
-        "-e", f"WORKSPACE_DIR={WORKSPACE_DIR}",
-        CONTAINER_NAME,
-    ]
-    if engine == "opencode":
+
+    if engine == "pi":
+        # ---- pi engine: inject PI_* env (no ANTHROPIC_* path) ----
+        active_prov = provider
+        active_mdl = _effective_model(chat_id, active_prov)
+        if not active_mdl or active_mdl == "?":
+            _post_card(chat_id, f"❌ pi 引擎需要为 `{active_prov}` 配置模型。用 `/model <name>` 设置。")
+            _release_chat(chat_id)
+            return
+        # DS r8: normalize model — take last part after "/" for provider-config models
+        active_mdl = active_mdl.rsplit("/", 1)[-1]
+        cmd = ["docker", "exec", "-i"]
+        cmd += ["-e", f"PI_PROVIDERS={','.join(_PROVIDERS.keys())}"]
+        for prov_name, prov_cfg in _PROVIDERS.items():
+            P = f"PI_{prov_name.upper()}"
+            cmd += ["-e", f"{P}_BASE_URL={prov_cfg['base_url']}"]
+            cmd += ["-e", f"{P}_API_KEY_ENV={prov_name.upper()}_API_KEY"]
+            normalized = [m.rsplit("/", 1)[-1] for m in prov_cfg["models"]]
+            cmd += ["-e", f"{P}_MODELS={','.join(normalized)}"]
+            cmd += ["-e", f"{P}_API=anthropic-messages"]
+            if prov_cfg.get("api_key"):
+                cmd += ["-e", f"{prov_name.upper()}_API_KEY={prov_cfg['api_key']}"]
+        cmd += ["-e", f"PI_ACTIVE_PROVIDER={active_prov}-relay"]
+        cmd += ["-e", f"PI_ACTIVE_MODEL={active_mdl}"]
+        if os.environ.get("PI_USE_BEARER"):
+            cmd += ["-e", f"PI_USE_BEARER={os.environ['PI_USE_BEARER']}"]
+        # v2: per-chat thinking level + tool policy (pi-only)
+        if _chat_thinking.get(chat_id):
+            cmd += ["-e", f"PI_THINKING={_chat_thinking[chat_id]}"]
+        cmd += ["-e", f"PI_TOOLS_MODE={_chat_tools.get(chat_id, 'full')}"]
         cmd += [
-            "python3", "/app/agent_runner_opencode.py", "--prompt", prompt,
+            "-e", f"SAFE_TOOLS={SAFE_TOOLS}",
+            "-e", f"CONFIRM_TIMEOUT={CONFIRM_TIMEOUT}",
+            "-e", f"WORKSPACE_DIR={WORKSPACE_DIR}",
+            "-w", WORKSPACE_DIR,
+            CONTAINER_NAME,
         ]
+        cmd += ["python3", "/app/agent_runner_pi.py", "--prompt", prompt]
+        if resume:
+            cmd += ["--resume", resume]
+        _clean_env = {k: os.environ[k] for k in ("PATH", "HOME", "DOCKER_HOST", "TERM") if k in os.environ}
     else:
+        # ---- claude/opencode engine: ANTHROPIC_* path ----
+        # S4: resolve this turn's provider auth/model into a LOCAL dict (no global
+        # os.environ mutation) so concurrent turns can't cross-pair one provider's
+        # api_key with another's base_url. Provider override wins; else fall back to
+        # the host's static env. Then mirror AUTH_TOKEN→API_KEY (claude CLI reads
+        # only API_KEY).
+        _prov_env = _provider_env(provider, chat_id)
+        _fwd: dict[str, str] = {}
+        for var in _CLAUDE_FORWARD_VARS:
+            val = _prov_env.get(var) or os.environ.get(var)
+            if val:
+                _fwd[var] = val
+        if not _fwd.get("ANTHROPIC_API_KEY") and _fwd.get("ANTHROPIC_AUTH_TOKEN"):
+            _fwd["ANTHROPIC_API_KEY"] = _fwd["ANTHROPIC_AUTH_TOKEN"]
+        cmd = ["docker", "exec", "-i"]
+        for var in _CLAUDE_FORWARD_VARS:
+            if _fwd.get(var):
+                cmd += ["-e", f"{var}={_fwd[var]}"]
+        if engine == "opencode":
+            for var in ("OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY"):
+                if os.environ.get(var):
+                    cmd += ["-e", f"{var}={os.environ[var]}"]
+            if os.environ.get("OPENCODE_API_KEY") and not os.environ.get("ZHIPU_API_KEY"):
+                cmd += ["-e", f"ZHIPU_API_KEY={os.environ['OPENCODE_API_KEY']}"]
+            if os.environ.get("OPENCODE_BIN"):
+                cmd += ["-e", f"OPENCODE_BIN={os.environ['OPENCODE_BIN']}"]
         cmd += [
-            "python3", "/app/agent_runner.py", "--prompt", prompt,
+            "-e", f"SAFE_TOOLS={SAFE_TOOLS}",
+            "-e", f"CONFIRM_TIMEOUT={CONFIRM_TIMEOUT}",
+            "-e", f"WORKSPACE_DIR={WORKSPACE_DIR}",
+            CONTAINER_NAME,
         ]
-    if resume:
-        cmd += ["--resume", resume]
-
-
-    _passthrough_vars = _CLAUDE_FORWARD_VARS + (
-        "PATH", "HOME", "DOCKER_HOST", "TERM",
-    )
-    if engine == "opencode":
-        _passthrough_vars = _passthrough_vars + (
-            "OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY",
+        if engine == "opencode":
+            cmd += [
+                "python3", "/app/agent_runner_opencode.py", "--prompt", prompt,
+            ]
+        else:
+            cmd += [
+                "python3", "/app/agent_runner.py", "--prompt", prompt,
+            ]
+        if resume:
+            cmd += ["--resume", resume]
+        _passthrough_vars = _CLAUDE_FORWARD_VARS + (
+            "PATH", "HOME", "DOCKER_HOST", "TERM",
         )
-    # Use the per-turn resolved values (_fwd) for the Anthropic vars and host
-    # env for the rest — again avoiding global os.environ as per-turn scratch (S4).
-    _clean_env = {}
-    for k in _passthrough_vars:
-        if k in _CLAUDE_FORWARD_VARS:
-            if _fwd.get(k):
-                _clean_env[k] = _fwd[k]
-        elif k in os.environ:
-            _clean_env[k] = os.environ[k]
+        if engine == "opencode":
+            _passthrough_vars = _passthrough_vars + (
+                "OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY",
+            )
+        _clean_env = {}
+        for k in _passthrough_vars:
+            if k in _CLAUDE_FORWARD_VARS:
+                if _fwd.get(k):
+                    _clean_env[k] = _fwd[k]
+            elif k in os.environ:
+                _clean_env[k] = os.environ[k]
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -625,14 +667,57 @@ def _help_text() -> str:
         "`/resume <N|id>` — 恢复指定会话\n"
         "`/provider [name]` — 查看/切换厂商\n"
         "`/model [name]` — 查看/切换模型\n"
-        "`/engine <name>` — 切换引擎 (claude/opencode)\n"
+        "`/engine <name>` — 切换引擎 (claude/opencode/pi)\n"
+        "`/status` — 查看当前状态\n"
+        "`/thinking [level]` — pi 思考等级 (off~max)\n"
+        "`/tools [safe|full]` — pi 工具模式 (只读/全部)\n"
         "`/help` — 显示此帮助\n\n"
         "直接发消息即与 AI 对话"
     )
 
 
-# Cache for session listing to support /resume <序号>
-_session_list_cache: dict[str, list[dict]] = {}
+# Cache for session listing to support /resume <序号>.
+# v2: engine-keyed so a pi listing can never be consumed by a claude /resume
+# (and vice versa) — the engine that produced the list must match the current
+# engine at /resume time.
+_session_list_cache: dict[str, dict] = {}  # chat_id -> {"engine": str, "sessions": list}
+
+
+def _cache_sessions(chat_id: str, engine: str, sessions: list) -> None:
+    _session_list_cache[chat_id] = {"engine": engine, "sessions": sessions}
+
+
+def _cached_sessions(chat_id: str, engine: str) -> list | None:
+    """Return cached session list ONLY if it was produced by the same engine."""
+    entry = _session_list_cache.get(chat_id)
+    if entry and entry.get("engine") == engine:
+        return entry.get("sessions")
+    return None
+
+
+def _format_session_card(chat_id: str, engine: str, sessions: list) -> None:
+    """Render a session-listing card (shared by claude + pi handlers)."""
+    current = session_store.get(f"{engine}:{chat_id}")
+    lines = [f"📂 **会话列表** ({len(sessions)} 个)", ""]
+    for i, s in enumerate(sessions, 1):
+        sid = s.get("session_id", "?")
+        sid_short = sid[:13] + "..." if len(sid) > 16 else sid
+        ts = s.get("updated_at", s.get("created_at", "?"))
+        title = s.get("title", "")
+        model = s.get("model", "")
+        marker = " ← 当前" if sid == current else ""
+        line = f"{i}. `{sid_short}` | {ts}"
+        if model:
+            line += f" | {model}"
+        if title:
+            line += f" | {title}"
+        line += marker
+        lines.append(line)
+    lines.append("")
+    if current:
+        lines.append(f"当前活跃: `{current[:13]}...`")
+    lines.append("用 `/resume <序号或session_id>` 恢复")
+    _post_card(chat_id, "\n".join(lines))
 
 
 def _handle_sessions_cmd(chat_id: str) -> None:
@@ -650,28 +735,31 @@ def _handle_sessions_cmd(chat_id: str) -> None:
         if not sessions:
             _post_card(chat_id, "📂 暂无历史会话。\n发条消息开始第一次对话吧。")
             return
-        # Cache for /resume <序号>
-        _session_list_cache[chat_id] = sessions
-        # Build display
-        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
-        current = session_store.get(f"{engine}:{chat_id}")
-        lines = [f"📂 **会话列表** ({len(sessions)} 个)", ""]
-        for i, s in enumerate(sessions, 1):
-            sid = s.get("session_id", "?")
-            sid_short = sid[:13] + "..." if len(sid) > 16 else sid
-            ts = s.get("updated_at", s.get("created_at", "?"))
-            title = s.get("title", "")
-            marker = " ← 当前" if sid == current else ""
-            line = f"{i}. `{sid_short}` | {ts}"
-            if title:
-                line += f" | {title}"
-            line += marker
-            lines.append(line)
-        lines.append("")
-        if current:
-            lines.append(f"当前活跃: `{current[:13]}...`")
-        lines.append("用 `/resume <序号或session_id>` 恢复")
-        _post_card(chat_id, "\n".join(lines))
+        _cache_sessions(chat_id, "claude", sessions)
+        _format_session_card(chat_id, "claude", sessions)
+    except subprocess.TimeoutExpired:
+        _post_card(chat_id, "❌ 查询超时(30s),请稍后重试")
+    except Exception as e:
+        _post_card(chat_id, f"❌ 查询出错: {e}")
+
+
+def _handle_pi_sessions_cmd(chat_id: str) -> None:
+    """List pi sessions from the container via agent_runner_pi --list-sessions (v2)."""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", feishu_claude_agent_name(), "python3", "/app/agent_runner_pi.py", "--list-sessions"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            err = result.stdout.strip()[:500] or result.stderr.strip()[:500]
+            _post_card(chat_id, f"❌ 查询 pi 会话失败:\n```\n{err}\n```")
+            return
+        sessions = json.loads(result.stdout.strip())
+        if not sessions:
+            _post_card(chat_id, "📂 暂无 pi 历史会话。\n发条消息开始第一次对话吧。")
+            return
+        _cache_sessions(chat_id, "pi", sessions)
+        _format_session_card(chat_id, "pi", sessions)
     except subprocess.TimeoutExpired:
         _post_card(chat_id, "❌ 查询超时(30s),请稍后重试")
     except Exception as e:
@@ -679,9 +767,10 @@ def _handle_sessions_cmd(chat_id: str) -> None:
 
 
 def _handle_resume_cmd(chat_id: str, arg: str) -> None:
-    """Resume a session by sequence number or full session_id."""
+    """Resume a session by sequence number or full session_id (engine-aware, v2)."""
+    engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+
     if arg.lower() == "clear":
-        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
         session_store.clear(f"{engine}:{chat_id}")
         _post_card(chat_id, "✅ 已清除会话恢复,下条消息将开启新会话。")
         return
@@ -690,19 +779,21 @@ def _handle_resume_cmd(chat_id: str, arg: str) -> None:
     target_sid = None
     if arg.isdigit():
         idx = int(arg) - 1
-        sessions = _session_list_cache.get(chat_id, [])
+        sessions = _cached_sessions(chat_id, engine) or []
         if 0 <= idx < len(sessions):
             target_sid = sessions[idx].get("session_id")
+        elif not sessions:
+            _post_card(chat_id, "❌ 无当前引擎的会话列表。先发 `/sessions` 再用序号。")
+            return
         else:
             _post_card(chat_id, f"❌ 序号 {arg} 超出范围。先用 `/sessions` 查看列表。")
             return
     else:
         target_sid = arg.strip()
         # If the provided ID is shorter than a full UUID, try prefix-matching
-        # against cached sessions. This handles cases where the user copied a
-        # truncated ID from the /sessions card display.
+        # against cached sessions of the SAME engine only (v2: engine-keyed).
         if len(target_sid) < 36:
-            sessions = _session_list_cache.get(chat_id, [])
+            sessions = _cached_sessions(chat_id, engine) or []
             matches = [s["session_id"] for s in sessions
                        if s.get("session_id", "").startswith(target_sid)]
             if len(matches) == 1:
@@ -715,7 +806,6 @@ def _handle_resume_cmd(chat_id: str, arg: str) -> None:
         _post_card(chat_id, "❌ 无效的 session_id")
         return
 
-    engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
     session_store.put(f"{engine}:{chat_id}", target_sid)
     sid_short = target_sid[:13] + "..." if len(target_sid) > 16 else target_sid
     _post_card(chat_id, f"✅ 已设置会话恢复: `{sid_short}`\n下条消息将从该会话继续。")
@@ -750,6 +840,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     if text in ("/new", "/reset"):
         session_store.clear(f"claude:{chat_id}")
         session_store.clear(f"opencode:{chat_id}")
+        session_store.clear(f"pi:{chat_id}")
         _card_workers.submit(_post_card, chat_id, "🧹 已清除会话上下文,下条消息将开启新会话。")
         return
 
@@ -759,13 +850,13 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 
     if text.startswith("/engine "):
         eng = text.split(" ", 1)[1].strip().lower()
-        if eng in ("claude", "opencode"):
+        if eng in ("claude", "opencode", "pi"):
             _chat_engine[chat_id] = eng
-            session_store.clear(f"claude:{chat_id}")  # sessions are engine-specific
-            session_store.clear(f"opencode:{chat_id}")
+            for ns in ("claude", "opencode", "pi"):
+                session_store.clear(f"{ns}:{chat_id}")
             _card_workers.submit(_post_card, chat_id, f"⚙️ 引擎已切换: {eng}")
         else:
-            _card_workers.submit(_post_card, chat_id, f"未知引擎: {eng}。可用: claude / opencode")
+            _card_workers.submit(_post_card, chat_id, f"未知引擎: {eng}。可用: claude / opencode / pi")
         return
 
     if text == "/provider" or text.startswith("/provider "):
@@ -789,6 +880,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 # Clear session: different providers have incompatible APIs
                 session_store.clear(f"claude:{chat_id}")
                 session_store.clear(f"opencode:{chat_id}")
+                session_store.clear(f"pi:{chat_id}")
                 # Reset per-chat model so the new provider's default kicks in
                 _chat_model.pop(chat_id, None)
                 prov = _PROVIDERS[name]
@@ -820,12 +912,26 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             _card_workers.submit(_post_card, chat_id, "\n".join(lines))
         else:
             model_name = parts[1].strip()
+            # DS r5/r8: validate for pi engine + general safety
+            engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+            if engine == "pi" and "/" in model_name:
+                _card_workers.submit(_post_card, chat_id, "❌ pi 引擎请用不带 `/` 的模型名。")
+                return
+            if any(c in model_name for c in (" ", "\t", ",")):
+                _card_workers.submit(_post_card, chat_id, "❌ 模型名不能含空格或逗号。")
+                return
             _chat_model[chat_id] = model_name
             _card_workers.submit(_post_card, chat_id, f"🤖 模型已切换: `{model_name}`")
         return
 
     if text == "/sessions":
-        _card_workers.submit(_handle_sessions_cmd, chat_id)
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        if engine == "pi":
+            _card_workers.submit(_handle_pi_sessions_cmd, chat_id)
+        elif engine == "opencode":
+            _card_workers.submit(_post_card, chat_id, "⚠️ opencode 会话为临时会话，不支持列出。")
+        else:
+            _card_workers.submit(_handle_sessions_cmd, chat_id)
         return
 
     if text.startswith("/resume"):
@@ -835,6 +941,67 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         else:
             arg = parts[1].strip()
             _card_workers.submit(_handle_resume_cmd, chat_id, arg)
+        return
+
+    if text == "/status":
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
+        model = _effective_model(chat_id, provider)
+        sess = session_store.get(f"{engine}:{chat_id}") or "无"
+        if len(sess) > 16:
+            sess = sess[:13] + "..."
+        lines = [f"📊 **当前状态**", "",
+                 f"引擎: `{engine}`",
+                 f"厂商: `{provider}`",
+                 f"模型: `{model}`",
+                 f"会话: `{sess}`"]
+        if engine == "pi":
+            lines.append(f"思考等级: `{_chat_thinking.get(chat_id, '默认')}`")
+            lines.append(f"工具模式: `{_chat_tools.get(chat_id, 'full')}`")
+        _card_workers.submit(_post_card, chat_id, "\n".join(lines))
+        return
+
+    if text == "/thinking" or text.startswith("/thinking "):
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        if engine != "pi":
+            _card_workers.submit(_post_card, chat_id, "⚠️ `/thinking` 仅 pi 引擎支持。")
+            return
+        parts = text.split(None, 1)
+        levels = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+        if len(parts) < 2:
+            cur = _chat_thinking.get(chat_id, "默认")
+            _card_workers.submit(_post_card, chat_id,
+                f"🧠 **思考等级**: `{cur}`\n\n可用: {', '.join(levels)}\n用 `/thinking <level>` 切换")
+        else:
+            lvl = parts[1].strip().lower()
+            if lvl in levels:
+                _chat_thinking[chat_id] = lvl
+                _card_workers.submit(_post_card, chat_id, f"🧠 思考等级已设置: `{lvl}`")
+            else:
+                _card_workers.submit(_post_card, chat_id,
+                    f"❌ 无效等级 `{lvl}`。可用: {', '.join(levels)}")
+        return
+
+    if text == "/tools" or text.startswith("/tools "):
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        if engine != "pi":
+            _card_workers.submit(_post_card, chat_id, "⚠️ `/tools` 仅 pi 引擎支持。")
+            return
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            cur = _chat_tools.get(chat_id, "full")
+            desc = {"full": "全部工具（bash/edit/write/read/grep/find/ls）",
+                    "safe": "只读（read/grep/find/ls）——禁止 bash/edit/write"}
+            _card_workers.submit(_post_card, chat_id,
+                f"🔧 **工具模式**: `{cur}` — {desc.get(cur, '')}\n\n用 `/tools safe` 只读模式\n用 `/tools full` 全部工具")
+        else:
+            mode = parts[1].strip().lower()
+            if mode in ("safe", "full"):
+                _chat_tools[chat_id] = mode
+                extra = "\n⚠️ 只读模式下 bash/edit/write 被禁用。" if mode == "safe" else ""
+                _card_workers.submit(_post_card, chat_id, f"🔧 工具模式已设置: `{mode}`{extra}")
+            else:
+                _card_workers.submit(_post_card, chat_id, "❌ 无效模式。用 `/tools safe` 或 `/tools full`")
         return
 
     if len(text) > MAX_PROMPT_LEN:

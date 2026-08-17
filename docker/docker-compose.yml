@@ -37,6 +37,9 @@ services:
       # Mounted read-only under the non-root agent's HOME so the opencode engine
       # can read it. Path is configurable; defaults to ~/.local/share/opencode.
       - ${OPENCODE_AUTH_FILE:-~/.local/share/opencode/auth.json}:/home/agent/.local/share/opencode/auth.json:ro
+      # pi engine session persistence (survives container rebuild).
+      # Deploy: sudo mkdir -p "${WORKSPACE_DIR}/.pi-sessions" && sudo chown 1000:1000 "${WORKSPACE_DIR}/.pi-sessions"
+      - ${WORKSPACE_DIR}/.pi-sessions:/home/agent/.pi/agent/sessions
     working_dir: ${WORKSPACE_DIR}
     restart: unless-stopped
     command: ["sleep", "infinity"]

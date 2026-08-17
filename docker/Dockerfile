@@ -9,13 +9,17 @@ FROM python:3.12-slim-bookworm
 # Node.js (for the Claude Code CLI) + tools the agent expects (git, ripgrep).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl git ca-certificates ripgrep gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Claude Code CLI. Clean the npm cache in the SAME layer so it never lands in
 # an image layer (cleaning it in a later layer wouldn't shrink the image).
 RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
+
+# pi coding agent (Node.js v22 required for import-with syntax).
+# Pin version + --ignore-scripts to avoid postinstall hooks hanging the build.
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.1 && npm cache clean --force
 
 # OpenCode CLI (from GitHub releases).
 RUN curl -sL -o /tmp/opencode.tar.gz \
@@ -33,6 +37,7 @@ ENV PATH="/opt/agent/bin:${PATH}"
 WORKDIR /app
 COPY agent_runner.py /app/agent_runner.py
 COPY agent_runner_opencode.py /app/agent_runner_opencode.py
+COPY agent_runner_pi.py /app/agent_runner_pi.py
 
 # Non-root user (S3). uid/gid 1000 matches the typical host workspace owner so
 # the bind-mounted WORKSPACE_DIR stays writable while the agent drops root. HOME
@@ -41,6 +46,7 @@ COPY agent_runner_opencode.py /app/agent_runner_opencode.py
 RUN groupadd -g 1000 agent \
     && useradd -u 1000 -g 1000 -m -d /home/agent -s /bin/bash agent \
     && mkdir -p /home/agent/.config/opencode /home/agent/.local/share/opencode \
+    && mkdir -p /home/agent/.pi/agent/sessions \
     && chown -R agent:agent /home/agent
 USER agent
 

@@ -20,6 +20,7 @@
 # Exclude everything by default.
 **
 
-# Allow exactly the two files the Dockerfile COPYs into the image.
+# Allow exactly the files the Dockerfile COPYs into the image.
 !agent_runner.py
 !agent_runner_opencode.py
+!agent_runner_pi.py
