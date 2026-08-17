@@ -37,6 +37,13 @@ services:
       # Mounted read-only under the non-root agent's HOME so the opencode engine
       # can read it. Path is configurable; defaults to ~/.local/share/opencode.
       - ${OPENCODE_AUTH_FILE:-~/.local/share/opencode/auth.json}:/home/agent/.local/share/opencode/auth.json:ro
+      # pi engine session persistence (survives container rebuild).
+      # Deploy: sudo mkdir -p "${WORKSPACE_DIR}/.pi-sessions" && sudo chown 1000:1000 "${WORKSPACE_DIR}/.pi-sessions"
+      - ${WORKSPACE_DIR}/.pi-sessions:/home/agent/.pi/agent/sessions
+      # 干中学 skill：从已挂载的 workspace 仓库读（只读、随仓库自动更新）。路径都在 WORKSPACE_DIR 内，不新暴露宿主目录。
+      - ${WORKSPACE_DIR}/gan-zhong-xue/skills/gan-zhong-xue:/home/agent/.claude/skills/gan-zhong-xue:ro
+      # 干中学地图持久化：容器重建后地图不丢（否则 /home/agent/.gan-zhong-xue 是 ephemeral）。
+      - ${WORKSPACE_DIR}/.gan-zhong-xue-container:/home/agent/.gan-zhong-xue
     working_dir: ${WORKSPACE_DIR}
     restart: unless-stopped
     command: ["sleep", "infinity"]

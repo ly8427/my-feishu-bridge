@@ -309,6 +309,16 @@ async def run(prompt: str, resume: str | None) -> int:
             f"— do not claim to be Claude or any Anthropic product. Keep all file "
             f"operations within the current working directory."
         )
+    # Collab (v2 reserved — v1 reviewer whitelist is pi-only): APPEND the extra
+    # system prompt AFTER the identity prompt, never replace it. Order matters:
+    # a collab reviewer's JSON verdict contract must come last to survive
+    # prompt-injection from the reviewed material.
+    _extra_sp = os.environ.get("COLLAB_SYSTEM_PROMPT", "")
+    if _extra_sp:
+        if options.system_prompt:
+            options.system_prompt = options.system_prompt + "\n\n" + _extra_sp
+        else:
+            options.system_prompt = _extra_sp
 
     stdin_task = asyncio.create_task(_stdin_reader())
     final_text_parts: list[str] = []

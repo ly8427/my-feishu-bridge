@@ -130,7 +130,7 @@ def _apply_provider(name: str, chat_id: str = "") -> None:
         os.environ["ANTHROPIC_MODEL"] = prov["models"][0]
 
 
-def _provider_env(provider: str, chat_id: str = "") -> dict[str, str]:
+def _provider_env(provider: str, chat_id: str = "", model: str | None = None) -> dict[str, str]:
     """This turn's Anthropic auth/model vars from the provider table, computed
     WITHOUT touching global os.environ.
 
@@ -139,6 +139,10 @@ def _provider_env(provider: str, chat_id: str = "") -> dict[str, str]:
     read, pairing B's api_key with A's base_url (key POSTed to the wrong
     vendor). Returning a local dict per turn removes the shared mutable state.
     Mirrors the model selection in _apply_provider.
+
+    model: explicit per-turn override (collab steps). Takes priority over the
+    chat's /model value so an orchestrated review step can never be silently
+    re-targeted to whatever the user last set interactively.
     """
     prov = _PROVIDERS.get(provider, {})
     env: dict[str, str] = {}
@@ -147,9 +151,9 @@ def _provider_env(provider: str, chat_id: str = "") -> dict[str, str]:
     if prov.get("api_key"):
         env["ANTHROPIC_AUTH_TOKEN"] = prov["api_key"]
         env["ANTHROPIC_API_KEY"] = prov["api_key"]
-    model = _chat_model.get(chat_id) or (prov.get("models") or [""])[0]
-    if model:
-        env["ANTHROPIC_MODEL"] = model
+    mdl = model or _chat_model.get(chat_id) or (prov.get("models") or [""])[0]
+    if mdl:
+        env["ANTHROPIC_MODEL"] = mdl
     return env
 
 
@@ -157,20 +161,28 @@ def _provider_env(provider: str, chat_id: str = "") -> dict[str, str]:
 _chat_engine: dict[str, str] = {}
 _chat_provider: dict[str, str] = {}
 _chat_model: dict[str, str] = {}
+# pi-only per-chat options (v2): thinking level + tool policy
+_chat_thinking: dict[str, str] = {}   # chat_id -> off/minimal/low/medium/high/xhigh/max
+_chat_tools: dict[str, str] = {}      # chat_id -> "safe" | "full"
 
 # Apply default provider at startup so the first turn uses correct credentials.
 _apply_provider(_DEFAULT_PROVIDER)
 
 
-def _effective_model(chat_id: str, provider: str) -> str:
+def _effective_model(chat_id: str, provider: str, model: str | None = None) -> str:
     """Resolve the model that WILL actually be used on the next turn for this
-    chat: an explicit `/model` override wins, else the current provider's
-    default (first) model. Mirrors the selection in _apply_provider.
+    chat: an explicit per-turn override (collab) wins, then an explicit `/model`
+    override, else the current provider's default (first) model. Mirrors the
+    selection in _apply_provider.
+
+    model: explicit per-turn override (collab steps) — priority over /model.
 
     Do NOT read os.environ["ANTHROPIC_MODEL"] for display — that var is only
     refreshed by _apply_provider at turn-start, so right after `/provider` it
     still holds the *previous* provider's model (e.g. shows deepseek-v4-pro
     even after switching to zhipu)."""
+    if model:
+        return model
     override = _chat_model.get(chat_id)
     if override:
         return override
@@ -196,8 +208,9 @@ _CLAUDE_FORWARD_VARS = (
     "CLAUDE_CODE_EFFORT_LEVEL",
 )
 
-# per-chat engine preference (chat_id -> "claude" | "opencode")
-_chat_engine: dict[str, str] = {}
+# NOTE: _chat_engine is declared once at the per-chat state block above
+# (alongside _chat_provider/_chat_model/_chat_thinking/_chat_tools); the
+# duplicate declaration that used to live here was removed.
 
 from logging.handlers import RotatingFileHandler
 
@@ -243,6 +256,7 @@ class _RedactFilter(logging.Filter):
         r"|ticket=[A-Za-z0-9-]+"            # feishu WS connection ticket
         r"|app_secret=[A-Za-z0-9]+"         # feishu app secret if ever logged
         r"|(?:FEISHU_APP_SECRET|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENCODE_API_KEY|ZHIPU_API_KEY|DEEPSEEK_API_KEY)=[A-Za-z0-9_\-]+"
+        r"|[A-Z][A-Z0-9_]*_API_KEY=[A-Za-z0-9_\-]+"  # R2-5: generic API_KEY redaction (catches DEFAULT_API_KEY etc.)
         r"|sk-[A-Za-z0-9]{6,}"              # any Anthropic/relay bearer token
         r")"
     )
@@ -281,6 +295,12 @@ for _h in logging.getLogger().handlers:
 
 import session_store  # local module
 
+# Collab pipelines (imported after this module's definitions above exist;
+# injected explicitly because bridge runs as __main__ — a plain `import bridge`
+# inside collab would construct a second instance of this module).
+import collab  # local module
+collab.init(sys.modules[__name__])
+
 client = (
     lark.Client.builder()
     .app_id(APP_ID)
@@ -299,6 +319,31 @@ _card_workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="card")
 # confirm_id -> callable(allow: bool) that pushes the reply into the agent stdin
 _confirm_waiters: dict[str, "Job"] = {}
 _confirm_lock = threading.Lock()
+
+# Collab human gates ("continue fixing?"): gate_id -> callable(allow: bool).
+# Distinct from _confirm_waiters (which write to a live agent's stdin): a gate
+# has NO running process — the callback just sets the pipeline's event. Timeout
+# is owned by the pipeline's cancellable Timer, which pops the waiter so a
+# late tap lands on "已失效" (mirrors the confirm-waiter cleanup pattern).
+_gate_waiters: dict[str, object] = {}
+_gate_lock = threading.Lock()
+
+
+def _gate_buttons(gate_id: str) -> list:
+    return [
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "✅ 继续修复"},
+            "type": "primary",
+            "value": {"action": "collab_gate", "id": gate_id, "allow": True},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🛑 中止"},
+            "type": "danger",
+            "value": {"action": "collab_gate", "id": gate_id, "allow": False},
+        },
+    ]
 
 # T1: chats with an in-flight turn. Prevents two concurrent `docker exec` agents
 # from --resume-ing the same session_id (which corrupts its transcript). Guarded
@@ -381,12 +426,22 @@ def _confirm_buttons(confirm_id: str) -> list:
 class Job:
     chat_id: str
     proc: subprocess.Popen
-    engine: str  # "claude" | "opencode" — namespaces session_store keys per engine
+    engine: str  # "claude" | "opencode" | "pi" — namespaces session_store keys per engine
     out_q: queue.Queue  # raw stdout lines -> _render_loop (decouples read from HTTP)
     card_msg_id: str | None = None
     transcript: str = ""
     confirm_card_id: str | None = None  # message_id of the pending confirm card
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # --- collab turn-primitive fields (coordinator-facing) ---
+    result_text: str = ""              # final text from the runner's result message
+    ok: bool | None = None             # result.ok (None = no result seen); False = step error
+    error: str = ""                    # error message if the turn ended in error
+    session_id: str = ""               # ALWAYS captured from session events (rm cold sessions)
+    done: threading.Event = field(default_factory=threading.Event)  # set in render finally
+    holds_lock: bool = False           # True: this step did NOT acquire T1 (pipeline owns it)
+    persist_session: bool = True       # False: capture session_id but skip session_store.put
+    done_cb: object = None             # callable(job) fired once in render finally
+    run_id: str = ""                   # COLLAB_RUN_ID for precise container-side process kill
 
     def render(self, extra: str = "") -> None:
         with self.lock:
@@ -425,14 +480,25 @@ def _render_loop(job: Job) -> None:
     per-chat turn slot (T1) and drop any dangling confirm waiters for this job
     (T3) — even if the body raises — so a chat can never get stuck 'busy' and
     timed-out confirmations don't leak Job references.
+
+    Collab: steps with holds_lock=True did NOT acquire T1 (the pipeline
+    coordinator owns it), so they must not release it either.
     """
     try:
         _render_loop_body(job)
     finally:
-        _release_chat(job.chat_id)
+        if not job.holds_lock:
+            _release_chat(job.chat_id)
         with _confirm_lock:
             for _cid in [k for k, v in _confirm_waiters.items() if v is job]:
                 _confirm_waiters.pop(_cid, None)
+        # Collab turn-primitive: single guaranteed "turn over" signal.
+        job.done.set()
+        if job.done_cb is not None:
+            try:
+                job.done_cb(job)
+            except Exception:
+                log.exception("done_cb raised (ignored)")
 
 
 def _render_loop_body(job: Job) -> None:
@@ -462,9 +528,13 @@ def _render_loop_body(job: Job) -> None:
                 job.transcript += extra
             job.render()
         elif mtype == "session":
-            # Namespace by engine so OpenCode's 'ses_xxx' ids never reach
-            # claude's --resume (which requires a UUID).
-            session_store.put(f"{job.engine}:{job.chat_id}", msg["session_id"])
+            # ALWAYS capture the id (collab deletes cold review session files
+            # by it); only persist when this step owns the chat's session.
+            job.session_id = msg.get("session_id", "") or job.session_id
+            if job.persist_session:
+                # Namespace by engine so OpenCode's 'ses_xxx' ids never reach
+                # claude's --resume (which requires a UUID).
+                session_store.put(f"{job.engine}:{job.chat_id}", msg["session_id"])
         elif mtype == "confirm_request":
             cid = msg["id"]
             with _confirm_lock:
@@ -485,11 +555,19 @@ def _render_loop_body(job: Job) -> None:
             log.info("confirm card posted: id=%s tool=%s", cid, msg.get("tool"))
         elif mtype == "result":
             final = msg.get("text", "").strip()
+            # Collab: capture the result for the coordinator; ok=False (e.g.
+            # opencode session.error) is a step error, not an empty result.
+            job.result_text = final
+            job.ok = bool(msg.get("ok", True))
+            if not job.ok:
+                job.error = msg.get("error", "result reported ok=false")
             if final and final not in job.transcript:
                 with job.lock:
                     job.transcript += "\n" + final
             job.render()
         elif mtype == "error":
+            job.error = msg.get("message", "")
+            job.ok = False
             job.render(f"\n\n❌ 出错: {msg.get('message')}")
         else:
             log.info("agent diagnostic: %s", str(msg)[:300])
@@ -504,96 +582,191 @@ def _safe_start_turn(chat_id: str, text: str) -> None:
         # The T1 slot is acquired inside _start_turn before any failure point;
         # the render thread that normally releases it never started, so release
         # here to avoid wedging the chat in a permanent 'busy' state.
+        # NOTE: this path serves NORMAL turns only (holds_lock is always False
+        # here). Collab pipeline steps call _start_turn directly with their own
+        # try/except, so this release can never drop the pipeline's T1 slot.
         _release_chat(chat_id)
 
 
-def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
+# Internal prompt cap: on_message enforces MAX_PROMPT_LEN for user input, but
+# collab composes prompts internally (task + feedback + staged refs) — enforce
+# the same bound here so a composed prompt can never blow docker-exec argv.
+_INTERNAL_PROMPT_MAX = 8000
+
+
+def _start_turn(
+    chat_id: str,
+    prompt: str,
+    engine: str | None = None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    system_prompt: str | None = None,   # APPENDED to the identity prompt in the runner
+    no_resume: bool = False,            # cold turn (collab reviewer): resume forced None
+    persist_session: bool = True,       # False: capture session_id, skip session_store.put
+    hold_lock: bool = False,            # True: T1 already held by the caller (pipeline)
+    tools_mode: str | None = None,      # pi: "safe"|"full" (overrides per-chat /tools)
+    safe_tools: str | None = None,      # claude: overrides SAFE_TOOLS for this turn
+    confirm_timeout: str | None = None, # overrides CONFIRM_TIMEOUT for this turn
+    pi_turn_timeout: str | None = None, # pi: overrides PI_TURN_TIMEOUT for this turn
+    pi_idle_timeout: str | None = None, # pi: overrides PI_IDLE_TIMEOUT for this turn
+    initial_card_text: str | None = None,  # per-step card text (collab step labeling)
+    done_cb=None,                       # callable(job), fired once in render finally
+    run_id: str | None = None,          # COLLAB_RUN_ID: precise container-side kill key
+) -> Job:
     # T1: one in-flight turn per chat. Two concurrent turns would launch two
     # `docker exec` agents that --resume the SAME session_id and corrupt its
     # transcript. If a turn is already running, tell the user and bail; the slot
     # is released in _render_loop's finally (or by _safe_start_turn on crash).
-    with _active_lock:
-        if chat_id in _active_chats:
-            _post_card(chat_id, "⏳ 上一条指令还在处理中，请等它完成后再发一条。")
-            return
-        _active_chats.add(chat_id)
+    # hold_lock: the pipeline coordinator already acquired T1 atomically for
+    # the whole pipeline — steps must not re-check (they'd trip on their own
+    # pipeline's slot) and must not release it.
+    if not hold_lock:
+        with _active_lock:
+            if chat_id in _active_chats:
+                _post_card(chat_id, "⏳ 上一条指令还在处理中，请等它完成后再发一条。")
+                return None  # type: ignore[return-value]
+            _active_chats.add(chat_id)
     engine = engine or _chat_engine.get(chat_id, DEFAULT_ENGINE)
     resume = session_store.get(f"{engine}:{chat_id}")
+    if no_resume:
+        resume = None
     # OpenCode sessions are ephemeral — each runner starts a fresh server,
     # so cross-runner resume is meaningless.
     if engine == "opencode":
         resume = None
-    # Forward whichever Claude auth vars are set on the host. This machine uses
-    # a relay (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN); an official key works too.
-    # claude-code CLI (>=2.1.x) authenticates ONLY via ANTHROPIC_API_KEY (or
-    # apiKeyHelper) — it ignores ANTHROPIC_AUTH_TOKEN entirely, yielding
-    # "Not logged in" / apiKeySource:none in stream-json mode. Relay setups put
-    # the bearer in ANTHROPIC_AUTH_TOKEN, so mirror it into ANTHROPIC_API_KEY
-    # when the latter is unset. The deepseek /anthropic endpoint accepts the
-    # same value as an x-api-key header.
-    # Apply per-chat provider and model overrides BEFORE building the docker exec
-    # command, so the -e flags pick up the right BASE_URL/API_KEY/MODEL.
-    provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
-    # S4: resolve this turn's provider auth/model into a LOCAL dict (no global
-    # os.environ mutation) so concurrent turns can't cross-pair one provider's
-    # api_key with another's base_url. Provider override wins; else fall back to
-    # the host's static env. Then mirror AUTH_TOKEN→API_KEY (claude CLI reads
-    # only API_KEY).
-    _prov_env = _provider_env(provider, chat_id)
-    _fwd: dict[str, str] = {}
-    for var in _CLAUDE_FORWARD_VARS:
-        val = _prov_env.get(var) or os.environ.get(var)
-        if val:
-            _fwd[var] = val
-    if not _fwd.get("ANTHROPIC_API_KEY") and _fwd.get("ANTHROPIC_AUTH_TOKEN"):
-        _fwd["ANTHROPIC_API_KEY"] = _fwd["ANTHROPIC_AUTH_TOKEN"]
-    cmd = ["docker", "exec", "-i"]
-    for var in _CLAUDE_FORWARD_VARS:
-        if _fwd.get(var):
-            cmd += ["-e", f"{var}={_fwd[var]}"]
-    if engine == "opencode":
-        for var in ("OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY"):
-            if os.environ.get(var):
-                cmd += ["-e", f"{var}={os.environ[var]}"]
-        # Also set ZHIPU_API_KEY from OPENCODE_API_KEY so built-in provider auto-detects
-        if os.environ.get("OPENCODE_API_KEY") and not os.environ.get("ZHIPU_API_KEY"):
-            cmd += ["-e", f"ZHIPU_API_KEY={os.environ['OPENCODE_API_KEY']}"]
-        if os.environ.get("OPENCODE_BIN"):
-            cmd += ["-e", f"OPENCODE_BIN={os.environ['OPENCODE_BIN']}"]
-    cmd += [
-        "-e", f"SAFE_TOOLS={SAFE_TOOLS}",
-        "-e", f"CONFIRM_TIMEOUT={CONFIRM_TIMEOUT}",
-        "-e", f"WORKSPACE_DIR={WORKSPACE_DIR}",
-        CONTAINER_NAME,
-    ]
-    if engine == "opencode":
+    # Internal composed prompts get the same bound as user input.
+    if len(prompt) > _INTERNAL_PROMPT_MAX:
+        prompt = prompt[:_INTERNAL_PROMPT_MAX] + "\n…(内部指令过长已截断)"
+    provider = provider or _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
+
+    if engine == "pi":
+        # ---- pi engine: inject PI_* env (no ANTHROPIC_* path) ----
+        active_prov = provider
+        active_mdl = _effective_model(chat_id, active_prov, model)
+        if not active_mdl or active_mdl == "?":
+            _post_card(chat_id, f"❌ pi 引擎需要为 `{active_prov}` 配置模型。用 `/model <name>` 设置。")
+            # R2: Job isn't constructed yet, so gate on the hold_lock PARAMETER —
+            # a collab step must never drop the pipeline's T1 slot. (Collab also
+            # pre-validates models before starting, so this is defense in depth.)
+            if not hold_lock:
+                _release_chat(chat_id)
+            return None  # type: ignore[return-value]
+        # DS r8: normalize model — take last part after "/" for provider-config models
+        active_mdl = active_mdl.rsplit("/", 1)[-1]
+        cmd = ["docker", "exec", "-i"]
+        cmd += ["-e", f"PI_PROVIDERS={','.join(_PROVIDERS.keys())}"]
+        for prov_name, prov_cfg in _PROVIDERS.items():
+            P = f"PI_{prov_name.upper()}"
+            cmd += ["-e", f"{P}_BASE_URL={prov_cfg['base_url']}"]
+            cmd += ["-e", f"{P}_API_KEY_ENV={prov_name.upper()}_API_KEY"]
+            normalized = [m.rsplit("/", 1)[-1] for m in prov_cfg["models"]]
+            cmd += ["-e", f"{P}_MODELS={','.join(normalized)}"]
+            cmd += ["-e", f"{P}_API=anthropic-messages"]
+            if prov_cfg.get("api_key"):
+                cmd += ["-e", f"{prov_name.upper()}_API_KEY={prov_cfg['api_key']}"]
+        cmd += ["-e", f"PI_ACTIVE_PROVIDER={active_prov}-relay"]
+        cmd += ["-e", f"PI_ACTIVE_MODEL={active_mdl}"]
+        if os.environ.get("PI_USE_BEARER"):
+            cmd += ["-e", f"PI_USE_BEARER={os.environ['PI_USE_BEARER']}"]
+        # v2: per-chat thinking level + tool policy (pi-only);
+        # collab steps override via tools_mode without touching shared state
+        if _chat_thinking.get(chat_id):
+            cmd += ["-e", f"PI_THINKING={_chat_thinking[chat_id]}"]
+        cmd += ["-e", f"PI_TOOLS_MODE={tools_mode or _chat_tools.get(chat_id, 'full')}"]
+        # collab per-step extras: extra system prompt (APPENDED after the
+        # identity prompt by the runner), precise kill key, timeout overrides
+        if system_prompt:
+            cmd += ["-e", f"PI_EXTRA_SYSTEM_PROMPT={system_prompt}"]
+        if run_id:
+            cmd += ["-e", f"COLLAB_RUN_ID={run_id}"]
+        if pi_turn_timeout:
+            cmd += ["-e", f"PI_TURN_TIMEOUT={pi_turn_timeout}"]
+        if pi_idle_timeout:
+            cmd += ["-e", f"PI_IDLE_TIMEOUT={pi_idle_timeout}"]
         cmd += [
-            "python3", "/app/agent_runner_opencode.py", "--prompt", prompt,
+            "-e", f"SAFE_TOOLS={SAFE_TOOLS}",
+            "-e", f"CONFIRM_TIMEOUT={confirm_timeout or CONFIRM_TIMEOUT}",
+            "-e", f"WORKSPACE_DIR={WORKSPACE_DIR}",
+            "-w", WORKSPACE_DIR,
+            CONTAINER_NAME,
         ]
+        cmd += ["python3", "/app/agent_runner_pi.py", "--prompt", prompt]
+        if resume:
+            cmd += ["--resume", resume]
+        _clean_env = {k: os.environ[k] for k in ("PATH", "HOME", "DOCKER_HOST", "TERM") if k in os.environ}
+        if system_prompt:
+            _clean_env["PI_EXTRA_SYSTEM_PROMPT"] = system_prompt
+        if run_id:
+            _clean_env["COLLAB_RUN_ID"] = run_id
     else:
+        # ---- claude/opencode engine: ANTHROPIC_* path ----
+        # S4: resolve this turn's provider auth/model into a LOCAL dict (no global
+        # os.environ mutation) so concurrent turns can't cross-pair one provider's
+        # api_key with another's base_url. Provider override wins; else fall back to
+        # the host's static env. Then mirror AUTH_TOKEN→API_KEY (claude CLI reads
+        # only API_KEY).
+        _prov_env = _provider_env(provider, chat_id, model)
+        _fwd: dict[str, str] = {}
+        for var in _CLAUDE_FORWARD_VARS:
+            val = _prov_env.get(var) or os.environ.get(var)
+            if val:
+                _fwd[var] = val
+        if not _fwd.get("ANTHROPIC_API_KEY") and _fwd.get("ANTHROPIC_AUTH_TOKEN"):
+            _fwd["ANTHROPIC_API_KEY"] = _fwd["ANTHROPIC_AUTH_TOKEN"]
+        cmd = ["docker", "exec", "-i"]
+        for var in _CLAUDE_FORWARD_VARS:
+            if _fwd.get(var):
+                cmd += ["-e", f"{var}={_fwd[var]}"]
+        if engine == "opencode":
+            for var in ("OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY"):
+                if os.environ.get(var):
+                    cmd += ["-e", f"{var}={os.environ[var]}"]
+            if os.environ.get("OPENCODE_API_KEY") and not os.environ.get("ZHIPU_API_KEY"):
+                cmd += ["-e", f"ZHIPU_API_KEY={os.environ['OPENCODE_API_KEY']}"]
+            if os.environ.get("OPENCODE_BIN"):
+                cmd += ["-e", f"OPENCODE_BIN={os.environ['OPENCODE_BIN']}"]
+        # collab per-step extras (claude path). COLLAB_SYSTEM_PROMPT is a v2
+        # RESERVED pipe (v1 reviewer whitelist is pi-only) — wired now so the
+        # claude reviewer later needs zero bridge changes.
+        if system_prompt:
+            cmd += ["-e", f"COLLAB_SYSTEM_PROMPT={system_prompt}"]
+        if run_id:
+            cmd += ["-e", f"COLLAB_RUN_ID={run_id}"]
         cmd += [
-            "python3", "/app/agent_runner.py", "--prompt", prompt,
+            "-e", f"SAFE_TOOLS={safe_tools or SAFE_TOOLS}",
+            "-e", f"CONFIRM_TIMEOUT={confirm_timeout or CONFIRM_TIMEOUT}",
+            "-e", f"WORKSPACE_DIR={WORKSPACE_DIR}",
+            CONTAINER_NAME,
         ]
-    if resume:
-        cmd += ["--resume", resume]
-
-
-    _passthrough_vars = _CLAUDE_FORWARD_VARS + (
-        "PATH", "HOME", "DOCKER_HOST", "TERM",
-    )
-    if engine == "opencode":
-        _passthrough_vars = _passthrough_vars + (
-            "OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY",
+        if engine == "opencode":
+            cmd += [
+                "python3", "/app/agent_runner_opencode.py", "--prompt", prompt,
+            ]
+        else:
+            cmd += [
+                "python3", "/app/agent_runner.py", "--prompt", prompt,
+            ]
+        if resume:
+            cmd += ["--resume", resume]
+        _passthrough_vars = _CLAUDE_FORWARD_VARS + (
+            "PATH", "HOME", "DOCKER_HOST", "TERM",
         )
-    # Use the per-turn resolved values (_fwd) for the Anthropic vars and host
-    # env for the rest — again avoiding global os.environ as per-turn scratch (S4).
-    _clean_env = {}
-    for k in _passthrough_vars:
-        if k in _CLAUDE_FORWARD_VARS:
-            if _fwd.get(k):
-                _clean_env[k] = _fwd[k]
-        elif k in os.environ:
-            _clean_env[k] = os.environ[k]
+        if engine == "opencode":
+            _passthrough_vars = _passthrough_vars + (
+                "OPENCODE_API_KEY", "OPENCODE_API_URL", "OPENCODE_MODEL", "ZHIPU_API_KEY",
+            )
+        _clean_env = {}
+        for k in _passthrough_vars:
+            if k in _CLAUDE_FORWARD_VARS:
+                if _fwd.get(k):
+                    _clean_env[k] = _fwd[k]
+            elif k in os.environ:
+                _clean_env[k] = os.environ[k]
+        if system_prompt:
+            _clean_env["COLLAB_SYSTEM_PROMPT"] = system_prompt
+        if run_id:
+            _clean_env["COLLAB_RUN_ID"] = run_id
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -603,17 +776,19 @@ def _start_turn(chat_id: str, prompt: str, engine: str | None = None) -> None:
         bufsize=1,
         env=_clean_env,
     )
-    job = Job(chat_id=chat_id, proc=proc, engine=engine, out_q=queue.Queue())
-    job.card_msg_id = _post_card(chat_id, "🤔 已收到,正在处理…")
+    job = Job(chat_id=chat_id, proc=proc, engine=engine, out_q=queue.Queue(),
+              holds_lock=hold_lock, persist_session=persist_session,
+              done_cb=done_cb, run_id=run_id or "")
+    job.card_msg_id = _post_card(chat_id, initial_card_text or "🤔 已收到,正在处理…")
     # Read thread: drains agent stdout into job.out_q (no HTTP, never stalls).
     # Render thread: consumes job.out_q and calls lark API to update cards.
     # Splitting these is what stops a slow lark HTTP call from back-pressuring
     # the agent's stdout (the root cause of multi-minute stalls).
     threading.Thread(target=_drain_job, args=(job,), daemon=True).start()
-    _prov = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
-    _mdl = _effective_model(chat_id, _prov)
-    log.info("turn started: engine=%s provider=%s model=%s", engine, _prov, _mdl)
+    log.info("turn started: engine=%s provider=%s model=%s", engine, provider,
+             _effective_model(chat_id, provider, model))
     threading.Thread(target=_render_loop, args=(job,), daemon=True).start()
+    return job
 
 
 # ---------------------------------------------------------------- slash command helpers
@@ -625,14 +800,59 @@ def _help_text() -> str:
         "`/resume <N|id>` — 恢复指定会话\n"
         "`/provider [name]` — 查看/切换厂商\n"
         "`/model [name]` — 查看/切换模型\n"
-        "`/engine <name>` — 切换引擎 (claude/opencode)\n"
+        "`/engine <name>` — 切换引擎 (claude/opencode/pi)\n"
+        "`/status` — 查看当前状态\n"
+        "`/thinking [level]` — pi 思考等级 (off~max)\n"
+        "`/tools [safe|full]` — pi 工具模式 (只读/全部)\n"
+        "`/collab [spec] \"任务\"` — 多Agent协作（impl=引擎/厂商 review=引擎/厂商 rounds=N gate=true）\n"
+        "`/collab status|stop` — 查看/中止协作流水线\n"
         "`/help` — 显示此帮助\n\n"
         "直接发消息即与 AI 对话"
     )
 
 
-# Cache for session listing to support /resume <序号>
-_session_list_cache: dict[str, list[dict]] = {}
+# Cache for session listing to support /resume <序号>.
+# v2: engine-keyed so a pi listing can never be consumed by a claude /resume
+# (and vice versa) — the engine that produced the list must match the current
+# engine at /resume time.
+_session_list_cache: dict[str, dict] = {}  # chat_id -> {"engine": str, "sessions": list}
+
+
+def _cache_sessions(chat_id: str, engine: str, sessions: list) -> None:
+    _session_list_cache[chat_id] = {"engine": engine, "sessions": sessions}
+
+
+def _cached_sessions(chat_id: str, engine: str) -> list | None:
+    """Return cached session list ONLY if it was produced by the same engine."""
+    entry = _session_list_cache.get(chat_id)
+    if entry and entry.get("engine") == engine:
+        return entry.get("sessions")
+    return None
+
+
+def _format_session_card(chat_id: str, engine: str, sessions: list) -> None:
+    """Render a session-listing card (shared by claude + pi handlers)."""
+    current = session_store.get(f"{engine}:{chat_id}")
+    lines = [f"📂 **会话列表** ({len(sessions)} 个)", ""]
+    for i, s in enumerate(sessions, 1):
+        sid = s.get("session_id", "?")
+        sid_short = sid[:13] + "..." if len(sid) > 16 else sid
+        ts = s.get("updated_at", s.get("created_at", "?"))
+        title = s.get("title", "")
+        model = s.get("model", "")
+        marker = " ← 当前" if sid == current else ""
+        line = f"{i}. `{sid_short}` | {ts}"
+        if model:
+            line += f" | {model}"
+        if title:
+            line += f" | {title}"
+        line += marker
+        lines.append(line)
+    lines.append("")
+    if current:
+        lines.append(f"当前活跃: `{current[:13]}...`")
+    lines.append("用 `/resume <序号或session_id>` 恢复")
+    _post_card(chat_id, "\n".join(lines))
 
 
 def _handle_sessions_cmd(chat_id: str) -> None:
@@ -650,28 +870,31 @@ def _handle_sessions_cmd(chat_id: str) -> None:
         if not sessions:
             _post_card(chat_id, "📂 暂无历史会话。\n发条消息开始第一次对话吧。")
             return
-        # Cache for /resume <序号>
-        _session_list_cache[chat_id] = sessions
-        # Build display
-        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
-        current = session_store.get(f"{engine}:{chat_id}")
-        lines = [f"📂 **会话列表** ({len(sessions)} 个)", ""]
-        for i, s in enumerate(sessions, 1):
-            sid = s.get("session_id", "?")
-            sid_short = sid[:13] + "..." if len(sid) > 16 else sid
-            ts = s.get("updated_at", s.get("created_at", "?"))
-            title = s.get("title", "")
-            marker = " ← 当前" if sid == current else ""
-            line = f"{i}. `{sid_short}` | {ts}"
-            if title:
-                line += f" | {title}"
-            line += marker
-            lines.append(line)
-        lines.append("")
-        if current:
-            lines.append(f"当前活跃: `{current[:13]}...`")
-        lines.append("用 `/resume <序号或session_id>` 恢复")
-        _post_card(chat_id, "\n".join(lines))
+        _cache_sessions(chat_id, "claude", sessions)
+        _format_session_card(chat_id, "claude", sessions)
+    except subprocess.TimeoutExpired:
+        _post_card(chat_id, "❌ 查询超时(30s),请稍后重试")
+    except Exception as e:
+        _post_card(chat_id, f"❌ 查询出错: {e}")
+
+
+def _handle_pi_sessions_cmd(chat_id: str) -> None:
+    """List pi sessions from the container via agent_runner_pi --list-sessions (v2)."""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", feishu_claude_agent_name(), "python3", "/app/agent_runner_pi.py", "--list-sessions"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            err = result.stdout.strip()[:500] or result.stderr.strip()[:500]
+            _post_card(chat_id, f"❌ 查询 pi 会话失败:\n```\n{err}\n```")
+            return
+        sessions = json.loads(result.stdout.strip())
+        if not sessions:
+            _post_card(chat_id, "📂 暂无 pi 历史会话。\n发条消息开始第一次对话吧。")
+            return
+        _cache_sessions(chat_id, "pi", sessions)
+        _format_session_card(chat_id, "pi", sessions)
     except subprocess.TimeoutExpired:
         _post_card(chat_id, "❌ 查询超时(30s),请稍后重试")
     except Exception as e:
@@ -679,9 +902,10 @@ def _handle_sessions_cmd(chat_id: str) -> None:
 
 
 def _handle_resume_cmd(chat_id: str, arg: str) -> None:
-    """Resume a session by sequence number or full session_id."""
+    """Resume a session by sequence number or full session_id (engine-aware, v2)."""
+    engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+
     if arg.lower() == "clear":
-        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
         session_store.clear(f"{engine}:{chat_id}")
         _post_card(chat_id, "✅ 已清除会话恢复,下条消息将开启新会话。")
         return
@@ -690,19 +914,21 @@ def _handle_resume_cmd(chat_id: str, arg: str) -> None:
     target_sid = None
     if arg.isdigit():
         idx = int(arg) - 1
-        sessions = _session_list_cache.get(chat_id, [])
+        sessions = _cached_sessions(chat_id, engine) or []
         if 0 <= idx < len(sessions):
             target_sid = sessions[idx].get("session_id")
+        elif not sessions:
+            _post_card(chat_id, "❌ 无当前引擎的会话列表。先发 `/sessions` 再用序号。")
+            return
         else:
             _post_card(chat_id, f"❌ 序号 {arg} 超出范围。先用 `/sessions` 查看列表。")
             return
     else:
         target_sid = arg.strip()
         # If the provided ID is shorter than a full UUID, try prefix-matching
-        # against cached sessions. This handles cases where the user copied a
-        # truncated ID from the /sessions card display.
+        # against cached sessions of the SAME engine only (v2: engine-keyed).
         if len(target_sid) < 36:
-            sessions = _session_list_cache.get(chat_id, [])
+            sessions = _cached_sessions(chat_id, engine) or []
             matches = [s["session_id"] for s in sessions
                        if s.get("session_id", "").startswith(target_sid)]
             if len(matches) == 1:
@@ -715,7 +941,6 @@ def _handle_resume_cmd(chat_id: str, arg: str) -> None:
         _post_card(chat_id, "❌ 无效的 session_id")
         return
 
-    engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
     session_store.put(f"{engine}:{chat_id}", target_sid)
     sid_short = target_sid[:13] + "..." if len(target_sid) > 16 else target_sid
     _post_card(chat_id, f"✅ 已设置会话恢复: `{sid_short}`\n下条消息将从该会话继续。")
@@ -750,6 +975,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     if text in ("/new", "/reset"):
         session_store.clear(f"claude:{chat_id}")
         session_store.clear(f"opencode:{chat_id}")
+        session_store.clear(f"pi:{chat_id}")
         _card_workers.submit(_post_card, chat_id, "🧹 已清除会话上下文,下条消息将开启新会话。")
         return
 
@@ -759,13 +985,13 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 
     if text.startswith("/engine "):
         eng = text.split(" ", 1)[1].strip().lower()
-        if eng in ("claude", "opencode"):
+        if eng in ("claude", "opencode", "pi"):
             _chat_engine[chat_id] = eng
-            session_store.clear(f"claude:{chat_id}")  # sessions are engine-specific
-            session_store.clear(f"opencode:{chat_id}")
+            for ns in ("claude", "opencode", "pi"):
+                session_store.clear(f"{ns}:{chat_id}")
             _card_workers.submit(_post_card, chat_id, f"⚙️ 引擎已切换: {eng}")
         else:
-            _card_workers.submit(_post_card, chat_id, f"未知引擎: {eng}。可用: claude / opencode")
+            _card_workers.submit(_post_card, chat_id, f"未知引擎: {eng}。可用: claude / opencode / pi")
         return
 
     if text == "/provider" or text.startswith("/provider "):
@@ -789,6 +1015,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 # Clear session: different providers have incompatible APIs
                 session_store.clear(f"claude:{chat_id}")
                 session_store.clear(f"opencode:{chat_id}")
+                session_store.clear(f"pi:{chat_id}")
                 # Reset per-chat model so the new provider's default kicks in
                 _chat_model.pop(chat_id, None)
                 prov = _PROVIDERS[name]
@@ -820,12 +1047,26 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             _card_workers.submit(_post_card, chat_id, "\n".join(lines))
         else:
             model_name = parts[1].strip()
+            # DS r5/r8: validate for pi engine + general safety
+            engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+            if engine == "pi" and "/" in model_name:
+                _card_workers.submit(_post_card, chat_id, "❌ pi 引擎请用不带 `/` 的模型名。")
+                return
+            if any(c in model_name for c in (" ", "\t", ",")):
+                _card_workers.submit(_post_card, chat_id, "❌ 模型名不能含空格或逗号。")
+                return
             _chat_model[chat_id] = model_name
             _card_workers.submit(_post_card, chat_id, f"🤖 模型已切换: `{model_name}`")
         return
 
     if text == "/sessions":
-        _card_workers.submit(_handle_sessions_cmd, chat_id)
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        if engine == "pi":
+            _card_workers.submit(_handle_pi_sessions_cmd, chat_id)
+        elif engine == "opencode":
+            _card_workers.submit(_post_card, chat_id, "⚠️ opencode 会话为临时会话，不支持列出。")
+        else:
+            _card_workers.submit(_handle_sessions_cmd, chat_id)
         return
 
     if text.startswith("/resume"):
@@ -835,6 +1076,81 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         else:
             arg = parts[1].strip()
             _card_workers.submit(_handle_resume_cmd, chat_id, arg)
+        return
+
+    if text == "/status":
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        provider = _chat_provider.get(chat_id, _DEFAULT_PROVIDER)
+        model = _effective_model(chat_id, provider)
+        sess = session_store.get(f"{engine}:{chat_id}") or "无"
+        if len(sess) > 16:
+            sess = sess[:13] + "..."
+        lines = [f"📊 **当前状态**", "",
+                 f"引擎: `{engine}`",
+                 f"厂商: `{provider}`",
+                 f"模型: `{model}`",
+                 f"会话: `{sess}`"]
+        if engine == "pi":
+            lines.append(f"思考等级: `{_chat_thinking.get(chat_id, '默认')}`")
+            lines.append(f"工具模式: `{_chat_tools.get(chat_id, 'full')}`")
+        _card_workers.submit(_post_card, chat_id, "\n".join(lines))
+        return
+
+    if text == "/thinking" or text.startswith("/thinking "):
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        if engine != "pi":
+            _card_workers.submit(_post_card, chat_id, "⚠️ `/thinking` 仅 pi 引擎支持。")
+            return
+        parts = text.split(None, 1)
+        levels = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+        if len(parts) < 2:
+            cur = _chat_thinking.get(chat_id, "默认")
+            _card_workers.submit(_post_card, chat_id,
+                f"🧠 **思考等级**: `{cur}`\n\n可用: {', '.join(levels)}\n用 `/thinking <level>` 切换")
+        else:
+            lvl = parts[1].strip().lower()
+            if lvl in levels:
+                _chat_thinking[chat_id] = lvl
+                _card_workers.submit(_post_card, chat_id, f"🧠 思考等级已设置: `{lvl}`")
+            else:
+                _card_workers.submit(_post_card, chat_id,
+                    f"❌ 无效等级 `{lvl}`。可用: {', '.join(levels)}")
+        return
+
+    if text == "/tools" or text.startswith("/tools "):
+        engine = _chat_engine.get(chat_id, DEFAULT_ENGINE)
+        if engine != "pi":
+            _card_workers.submit(_post_card, chat_id, "⚠️ `/tools` 仅 pi 引擎支持。")
+            return
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            cur = _chat_tools.get(chat_id, "full")
+            desc = {"full": "全部工具（bash/edit/write/read/grep/find/ls）",
+                    "safe": "只读（read/grep/find/ls）——禁止 bash/edit/write"}
+            _card_workers.submit(_post_card, chat_id,
+                f"🔧 **工具模式**: `{cur}` — {desc.get(cur, '')}\n\n用 `/tools safe` 只读模式\n用 `/tools full` 全部工具")
+        else:
+            mode = parts[1].strip().lower()
+            if mode in ("safe", "full"):
+                _chat_tools[chat_id] = mode
+                extra = "\n⚠️ 只读模式下 bash/edit/write 被禁用。" if mode == "safe" else ""
+                _card_workers.submit(_post_card, chat_id, f"🔧 工具模式已设置: `{mode}`{extra}")
+            else:
+                _card_workers.submit(_post_card, chat_id, "❌ 无效模式。用 `/tools safe` 或 `/tools full`")
+        return
+
+    if text == "/collab" or text.startswith("/collab "):
+        rest = text[len("/collab"):].strip()
+        _card_workers.submit(collab.handle_collab, chat_id, rest)
+        return
+
+    # Collab state lockout: commands that mutate session/engine/provider state
+    # would corrupt a running pipeline (e.g. /new between rounds kills the
+    # impl session the next round resumes).
+    if text.startswith("/") and collab.command_blocked(chat_id, text):
+        _card_workers.submit(_post_card, chat_id,
+            "⚠️ 协作流水线运行中，该命令已被暂时锁定（防止破坏流水线会话状态）。\n"
+            "用 `/collab status` 查看，`/collab stop` 中止。")
         return
 
     if len(text) > MAX_PROMPT_LEN:
@@ -870,6 +1186,23 @@ def on_card_action(data) -> dict | None:
     if operator != ALLOWED_USER_ID:
         log.warning("IGNORED card action from non-whitelisted: %s", operator)
         return {"toast": {"type": "error", "content": "无权限"}}
+
+    # collab human gate: no running process — the callback just sets the
+    # pipeline's event (must NOT do heavy work on the lark ws loop thread).
+    if value.get("action") == "collab_gate":
+        gid = value.get("id")
+        allow = bool(value.get("allow"))
+        with _gate_lock:
+            cb = _gate_waiters.pop(gid, None)
+        if cb is None:
+            return {"toast": {"type": "info", "content": "该门控已失效或已处理"}}
+        try:
+            cb(allow)
+        except Exception:
+            log.exception("gate callback raised")
+        return {"toast": {"type": "success" if allow else "info",
+                          "content": "✅ 继续" if allow else "🛑 中止"}}
+
     if value.get("action") != "confirm":
         return None
 
@@ -1176,6 +1509,12 @@ def main() -> None:
     # systemd restarts it with a clean connection. Healthy idle connections are
     # not mis-killed: the server keeps pushing pong/heartbeats (~every 120s).
     _start_connection_watchdog()
+
+    # Remove stale collab staging files (>24h) left by previous runs.
+    try:
+        collab.cleanup_stale()
+    except Exception:
+        log.exception("collab.cleanup_stale failed (non-fatal)")
 
     # The lark SDK's reconnect loop is bounded by a server-controlled
     # ReconnectCount. When retries are exhausted it raises

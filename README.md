@@ -4,7 +4,7 @@
 安全档位：**白名单 + 凭证隔离 + Docker 隔离 + 危险操作飞书确认**。
 
 无需公网 IP：用飞书 **WebSocket 长连接**接收事件。
-双引擎：**Claude Code**（默认）/ **OpenCode**（飞书 `/engine opencode` 切换）。
+三引擎：**Claude Code**（默认）/ **OpenCode** / **pi**（飞书 `/engine <name>` 切换）。
 
 > **跨平台**：bridge.py 可在 Windows / macOS / Linux / WSL 宿主机上用 `python3`
 > 直接运行（不再强依赖 systemd / bash 专属工具）。统一管理入口是 **`cli.py`**。
@@ -81,7 +81,7 @@ export FEISHU_ENV_FILE=~/.secrets/feishu-bridge.env
 | `OPENCODE_API_KEY` | OpenCode | 任意 OpenAI 兼容 API 的 Key |
 | `OPENCODE_API_URL` | OpenCode | API 端点（默认智谱 Coding Plan） |
 | `OPENCODE_MODEL` | 否 | `provider/model`，默认 `zhipuai-coding-plan/glm-5.1` |
-| `ENGINE` | 否 | 默认引擎 `claude` 或 `opencode` |
+| `ENGINE` | 否 | 默认引擎 `claude`、`opencode` 或 `pi` |
 | `WORKSPACE_DIR` | 否 | 挂载进容器的目录 |
 | `SAFE_TOOLS` | 否 | 自动放行的读类工具（逗号分隔） |
 | `CONFIRM_TIMEOUT` | 否 | 确认卡片超时秒数（默认 300） |
@@ -203,7 +203,10 @@ FEISHU_ENV_FILE=~/.secrets/feishu-bridge.env nohup .venv/bin/python3 bridge.py >
 - 发文本指令，例如：`列出最大的 5 个文件`、`修复 utils.py 的类型错误`
 - 读类操作自动执行；写文件 / 跑命令弹**确认卡片**，点 ✅ 执行，超时自动拒绝
 - `/new` 或 `/reset`：清除会话上下文，开新会话
-- `/engine opencode` 或 `/engine claude`：切换 AI 引擎（每个聊天独立）
+- `/engine opencode`、`/engine pi` 或 `/engine claude`：切换 AI 引擎（每个聊天独立）
+- `/status`：查看当前引擎/厂商/模型/会话
+- `/thinking [level]`：pi 思考等级（off/minimal/low/medium/high/xhigh/max）
+- `/tools [safe|full]`：pi 工具模式（safe=只读，full=全部工具）
 - 每个飞书 chat 维护独立会话（`sessions.json` → `chat_id → session_id`）
 
 ---
@@ -263,7 +266,7 @@ OpenCode 引擎通过 `opencode serve` 的 SSE 事件流 + REST API 驱动：
 | `agent_runner.py` | 容器内：Claude Agent SDK + `can_use_tool` 确认 + session resume |
 | `agent_runner_opencode.py` | 容器内：OpenCode serve SSE + permission.asked 拦截 + REST API |
 | `session_store.py` | chat_id → session_id 映射 |
-| `docker/Dockerfile` | 容器镜像：claude CLI + opencode CLI + agent SDK |
+| `docker/Dockerfile` | 容器镜像：claude CLI + opencode CLI + pi CLI + agent SDK |
 | `docker/docker-compose.yml` | 隔离容器，只挂载 workspace |
 | `wait-for-docker.sh` | 启动前门禁，等待 Docker Desktop socket 就绪（systemd 路径用） |
 | `.env.example` | 配置模板（复制到 `~/.secrets/feishu-bridge.env`） |
