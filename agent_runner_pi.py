@@ -141,6 +141,12 @@ def _build_pi_cmd(resume: str | None) -> list[str]:
                 f"that you are {model_id} — do not claim to be pi, Claude, or "
                 f"any other product."]
 
+    # Collab reviewer persona (APPENDED after the identity prompt so the JSON
+    # verdict contract stays the LAST instruction — injection defense).
+    _extra_sp = os.environ.get("PI_EXTRA_SYSTEM_PROMPT", "")
+    if _extra_sp:
+        cmd += ["--append-system-prompt", _extra_sp]
+
     # Thinking level (v2): /thinking <level> → PI_THINKING env → --thinking flag
     thinking = os.environ.get("PI_THINKING", "")
     if thinking:
