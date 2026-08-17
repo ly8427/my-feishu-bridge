@@ -199,8 +199,9 @@ _CLAUDE_FORWARD_VARS = (
     "CLAUDE_CODE_EFFORT_LEVEL",
 )
 
-# per-chat engine preference (chat_id -> "claude" | "opencode")
-_chat_engine: dict[str, str] = {}
+# NOTE: _chat_engine is declared once at the per-chat state block above
+# (alongside _chat_provider/_chat_model/_chat_thinking/_chat_tools); the
+# duplicate declaration that used to live here was removed.
 
 from logging.handlers import RotatingFileHandler
 
