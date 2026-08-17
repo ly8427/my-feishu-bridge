@@ -295,6 +295,12 @@ for _h in logging.getLogger().handlers:
 
 import session_store  # local module
 
+# Collab pipelines (imported after this module's definitions above exist;
+# injected explicitly because bridge runs as __main__ — a plain `import bridge`
+# inside collab would construct a second instance of this module).
+import collab  # local module
+collab.init(sys.modules[__name__])
+
 client = (
     lark.Client.builder()
     .app_id(APP_ID)
@@ -313,6 +319,31 @@ _card_workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="card")
 # confirm_id -> callable(allow: bool) that pushes the reply into the agent stdin
 _confirm_waiters: dict[str, "Job"] = {}
 _confirm_lock = threading.Lock()
+
+# Collab human gates ("continue fixing?"): gate_id -> callable(allow: bool).
+# Distinct from _confirm_waiters (which write to a live agent's stdin): a gate
+# has NO running process — the callback just sets the pipeline's event. Timeout
+# is owned by the pipeline's cancellable Timer, which pops the waiter so a
+# late tap lands on "已失效" (mirrors the confirm-waiter cleanup pattern).
+_gate_waiters: dict[str, object] = {}
+_gate_lock = threading.Lock()
+
+
+def _gate_buttons(gate_id: str) -> list:
+    return [
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "✅ 继续修复"},
+            "type": "primary",
+            "value": {"action": "collab_gate", "id": gate_id, "allow": True},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🛑 中止"},
+            "type": "danger",
+            "value": {"action": "collab_gate", "id": gate_id, "allow": False},
+        },
+    ]
 
 # T1: chats with an in-flight turn. Prevents two concurrent `docker exec` agents
 # from --resume-ing the same session_id (which corrupts its transcript). Guarded
@@ -773,6 +804,8 @@ def _help_text() -> str:
         "`/status` — 查看当前状态\n"
         "`/thinking [level]` — pi 思考等级 (off~max)\n"
         "`/tools [safe|full]` — pi 工具模式 (只读/全部)\n"
+        "`/collab [spec] \"任务\"` — 多Agent协作（impl=引擎/厂商 review=引擎/厂商 rounds=N gate=true）\n"
+        "`/collab status|stop` — 查看/中止协作流水线\n"
         "`/help` — 显示此帮助\n\n"
         "直接发消息即与 AI 对话"
     )
@@ -1106,6 +1139,20 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 _card_workers.submit(_post_card, chat_id, "❌ 无效模式。用 `/tools safe` 或 `/tools full`")
         return
 
+    if text == "/collab" or text.startswith("/collab "):
+        rest = text[len("/collab"):].strip()
+        _card_workers.submit(collab.handle_collab, chat_id, rest)
+        return
+
+    # Collab state lockout: commands that mutate session/engine/provider state
+    # would corrupt a running pipeline (e.g. /new between rounds kills the
+    # impl session the next round resumes).
+    if text.startswith("/") and collab.command_blocked(chat_id, text):
+        _card_workers.submit(_post_card, chat_id,
+            "⚠️ 协作流水线运行中，该命令已被暂时锁定（防止破坏流水线会话状态）。\n"
+            "用 `/collab status` 查看，`/collab stop` 中止。")
+        return
+
     if len(text) > MAX_PROMPT_LEN:
         _card_workers.submit(
             _post_card, chat_id,
@@ -1139,6 +1186,23 @@ def on_card_action(data) -> dict | None:
     if operator != ALLOWED_USER_ID:
         log.warning("IGNORED card action from non-whitelisted: %s", operator)
         return {"toast": {"type": "error", "content": "无权限"}}
+
+    # collab human gate: no running process — the callback just sets the
+    # pipeline's event (must NOT do heavy work on the lark ws loop thread).
+    if value.get("action") == "collab_gate":
+        gid = value.get("id")
+        allow = bool(value.get("allow"))
+        with _gate_lock:
+            cb = _gate_waiters.pop(gid, None)
+        if cb is None:
+            return {"toast": {"type": "info", "content": "该门控已失效或已处理"}}
+        try:
+            cb(allow)
+        except Exception:
+            log.exception("gate callback raised")
+        return {"toast": {"type": "success" if allow else "info",
+                          "content": "✅ 继续" if allow else "🛑 中止"}}
+
     if value.get("action") != "confirm":
         return None
 
@@ -1445,6 +1509,12 @@ def main() -> None:
     # systemd restarts it with a clean connection. Healthy idle connections are
     # not mis-killed: the server keeps pushing pong/heartbeats (~every 120s).
     _start_connection_watchdog()
+
+    # Remove stale collab staging files (>24h) left by previous runs.
+    try:
+        collab.cleanup_stale()
+    except Exception:
+        log.exception("collab.cleanup_stale failed (non-fatal)")
 
     # The lark SDK's reconnect loop is bounded by a server-controlled
     # ReconnectCount. When retries are exhausted it raises
