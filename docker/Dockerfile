@@ -45,7 +45,7 @@ COPY agent_runner_pi.py /app/agent_runner_pi.py
 # the opencode auth.json bind-mount lands under this HOME (see docker-compose).
 RUN groupadd -g 1000 agent \
     && useradd -u 1000 -g 1000 -m -d /home/agent -s /bin/bash agent \
-    && mkdir -p /home/agent/.config/opencode /home/agent/.local/share/opencode \
+    && mkdir -p /home/agent/.config/opencode /home/agent/.local/share/opencode /home/agent/.claude/skills \
     && mkdir -p /home/agent/.pi/agent/sessions \
     && chown -R agent:agent /home/agent
 USER agent
